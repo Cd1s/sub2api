@@ -89,6 +89,8 @@ type OpenAIAccountScheduleRequest struct {
 	// and compact_model_mapping; native remote compaction v2 leaves it false.
 	RequireCompact bool
 	ExcludedIDs    map[int64]struct{}
+	// oursTiers 见 openai_group_tiering.go：分组完整名单上算出的组内档位表。
+	oursTiers map[int64]int
 }
 
 type OpenAIAccountScheduleDecision struct {
@@ -689,8 +691,8 @@ func isOpenAIAccountCandidateBetter(left openAIAccountCandidateScore, right open
 	if left.score != right.score {
 		return left.score > right.score
 	}
-	if left.account.Priority != right.account.Priority {
-		return left.account.Priority < right.account.Priority
+	if leftPriority, rightPriority := openAICandidateOrderingPriority(left), openAICandidateOrderingPriority(right); leftPriority != rightPriority {
+		return leftPriority < rightPriority
 	}
 	if left.loadInfo.LoadRate != right.loadInfo.LoadRate {
 		return left.loadInfo.LoadRate < right.loadInfo.LoadRate
@@ -897,7 +899,8 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAIAccountLoadPlan(
 		return plan
 	}
 
-	minPriority, maxPriority := openAIAccountSchedulingPriority(candidates[0].account), openAIAccountSchedulingPriority(candidates[0].account)
+	tiers := openAIPlanTiers(req, candidates)
+	minPriority, maxPriority := openAISchedulingPriorityFor(candidates[0].account, tiers), openAISchedulingPriorityFor(candidates[0].account, tiers)
 	maxWaiting := 1
 	loadRateSum := 0.0
 	loadRateSumSquares := 0.0
@@ -905,7 +908,7 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAIAccountLoadPlan(
 	hasTTFTSample := false
 	for i := range candidates {
 		candidate := &candidates[i]
-		candidate.priority = openAIAccountSchedulingPriority(candidate.account)
+		candidate.priority = openAISchedulingPriorityFor(candidate.account, tiers)
 		if candidate.priority < minPriority {
 			minPriority = candidate.priority
 		}
@@ -1427,6 +1430,8 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 	if req.GroupID != nil && s.service.schedulerSnapshot != nil {
 		schedGroup, _ = s.service.schedulerSnapshot.GetGroupByID(ctx, *req.GroupID)
 	}
+
+	req.oursTiers = openAIAccountRosterTiers(accounts)
 
 	filterStats := openAISelectionFilterStats{pool: len(accounts)}
 	filtered := make([]*Account, 0, len(accounts))
@@ -2692,11 +2697,12 @@ func buildOpenAIAccountSchedulerScoreSnapshot(
 		return nil
 	}
 
-	minPriority, maxPriority := openAIAccountSchedulingPriority(candidates[0].account), openAIAccountSchedulingPriority(candidates[0].account)
+	tiers := openAITieredPriorities(accounts)
+	minPriority, maxPriority := openAISchedulingPriorityFor(candidates[0].account, tiers), openAISchedulingPriorityFor(candidates[0].account, tiers)
 	maxWaiting := 1
 	for i := range candidates {
 		candidate := &candidates[i]
-		candidate.priority = openAIAccountSchedulingPriority(candidate.account)
+		candidate.priority = openAISchedulingPriorityFor(candidate.account, tiers)
 		if candidate.priority < minPriority {
 			minPriority = candidate.priority
 		}
