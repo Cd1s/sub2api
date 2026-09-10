@@ -124,7 +124,7 @@ func openAICandidateOrderingPriority(candidate openAIAccountCandidateScore) int 
 |---|---|
 | 让某账号参与分档 | `bulk-update` 写 `credentials.ours_tiering: true` |
 | 让某账号退出分档（回到上游排法） | 写 `credentials.ours_tiering: false` |
-| 新加一个账号进某组、先观察不参与 | 什么都不做——不登记就不参与，它在该池里排第 4 档（最后），`scheduler_scores` 里显示为 4 |
+| 新加一个账号进某组、先观察不参与 | 什么都不做——不登记就不参与，它在该池里排第 4 档（最后），`base_score` 会落到该组最低（见第五节的验证方法） |
 | 让某账号给某组当备用 / 不再当备用 | 上游后台把它勾进 / 勾出该分组（`group_ids`，本来就有） |
 | 指定谁是某组的「本组账号」 | 让它是该组**登记账号**中全局 `priority` 最小的（现状即如此） |
 | 指定谁是「兜底」 | 让它是该组登记账号中 `priority` 最大的（monocle 998） |
@@ -171,7 +171,20 @@ func openAICandidateOrderingPriority(candidate openAIAccountCandidateScore) int 
 
 ## 五、部署与回滚
 
-部署由人工在生产按现有流程做：备份旧二进制 → 换二进制 → 重启 → 回读 `--version` → 跑验收脚本。
+部署流程：跑 origin guard → 上传到临时名并核 sha256 → 备份旧二进制 → 换二进制（`chown sub2api:sub2api`）→ 重启 → 回读版本 → 跑验收脚本。
+
+几个实测过的坑：
+
+- **不要跑 `/opt/sub2api/sub2api --version`**：它不是标准 flag，会真的启动进程、抢 8080 端口和数据库连接。
+  回读版本用管理 API：`GET /api/v1/admin/system/version`（带 `x-api-key`）→ `{"version":"0.2.4-ours"}`。
+  `GET /version` 会被前端 SPA 接管，拿不到后端版本；启动日志里也没有版本横幅。
+- **unit 里有 `ExecStartPre=+/usr/local/sbin/sub2api-origin-guard --prestart`**：它查 Cloudflare，确认三个域名 A 记录都指向本机，
+  任一对不上就 exit 1、服务起不来。换二进制前先单独跑一次确认放行，否则会误判成补丁的问题。
+- **unit 是 `User=sub2api`**：`sshctl put` 上传的文件属主是 root，换完要 `chown sub2api:sub2api` 恢复原状。
+- 管理 API 认证头是 `x-api-key`（`Authorization: Bearer` 会 401）；密钥文件在 `/etc/sub2api-tg-bot/sub2api-admin-key`，
+  只在服务器上用 `$(tr -d "\n" < 文件)` 引用，不要打印。
+- 数据库是容器里的 Postgres（`sub2api-containers.service` 只是 `podman start sub2api-postgres sub2api-redis`），
+  本补丁零迁移，不需要备份数据库。
 
 回滚（任选其一，**数据都不需要改**）：
 
@@ -179,8 +192,58 @@ func openAICandidateOrderingPriority(candidate openAIAccountCandidateScore) int 
 2. systemd unit 加 `Environment=SUB2API_OURS_GROUP_TIERING=0` 后重启（进程启动时读一次）；
 3. 把 9 个账号的 `credentials.ours_tiering` 改为 `false`。
 
-验证补丁是否生效：管理端 `GET /api/v1/admin/accounts` 返回的 `scheduler_scores[]` 里，
-登记账号的分档会体现为 1/2/3，**未登记的账号显示为 4** —— 一眼就能看出谁漏登记了。
+### 验证补丁是否生效
+
+管理端账号列表**默认不返回**调度打分，必须带 `include_scheduler_score=true`：
+
+```bash
+K=$(tr -d "\n" < /etc/sub2api-tg-bot/sub2api-admin-key)
+curl -sS -H "x-api-key: $K" \
+  "http://127.0.0.1:8080/api/v1/admin/accounts?include_scheduler_score=true&platform=openai&page=1&page_size=100"
+```
+
+每个账号的 `scheduler_scores[]` 按分组给出 `{group_id, base_score, sticky_score}`。
+**注意：这里没有 priority 字段，档位不会以 1/2/3/4 的数字形式出现**，只体现在 `base_score` 上。
+
+判读方法：取同一个 `group_id` 下所有账号的 `base_score` 排序看**形态**。
+线上权重（`weight_priority=10000`、`weight_error_rate=500`、其余 0）下，快照里 `errorFactor` 固定为 1，
+所以 `base_score = 10000 × pf + 500`：
+
+| 状态 | 同组 base_score 形态 |
+|---|---|
+| **未分档**（无登记账号 / 开关关闭） | 连续梯子，备用们分数**各不相同**（等差递减） |
+| **已分档**，组内有 1/2/3 档 | 本组 `10500`，备用们**全部同一个值** `5500`，兜底 `500` |
+| **已分档**，组内有 1/2/3/4 档 | 本组 `10500`，备用 `7166.67`，兜底 `3833.33`，未登记 `500` |
+
+备用们的分数从各不相同**塌缩成同一个值**，就是补丁生效的铁证；某个账号落在该组最低，
+且它不是兜底，就是漏登记了。这比看命中率快得多，不受上游风暴影响，不用等流量。
+
+#### 生产实测（2026-09-10，Oracle-SGwest-arm）
+
+组 12（本组 1868），登记前后：
+
+| 账号 | priority | 登记前 | 登记后 |
+|---|---|---|---|
+| 1868 | 30 | 10500.00 | 10500 |
+| 1860 | 40 | 10396.69 | **5500** |
+| 1866 | 50 | 10293.39 | **5500** |
+| 1865 | 60 | 10190.08 | **5500** |
+| 1864 | 70 | 10086.78 | **5500** |
+| 1863 | 80 | 9983.47 | **5500** |
+| 1872 | 998 | 500.00 | 500 |
+
+登记前那列可以手算核对：`pf(40) = 1 − (40−30)/968 = 0.98967` → `10000 × 0.98967 + 500 = 10396.7`，
+证明**未登记时新二进制的打分与上游逐字节一致**。
+
+组 2 验证了第 4 档：未登记的 1752 (Nube) 全局 priority=10，与本组 1869 相同，
+登记后仍落到 `500`（最后），而 1869 为 `10500`、两个备用同为 `7166.67`、兜底 `3833.33`。
+
+#### 验收脚本的窗口陷阱
+
+`/usr/local/sbin/sub2api-cascade-verify-daily` 的 current 窗口是「此刻往前 3 小时」。
+**刚部署或刚登记完就跑，报告里几乎全是旧行为的数据**，测不到补丁。
+要等补丁跑满一个窗口（3 小时）再看 `own_hit_pct` 与 `distinct_backup_accounts`。
+上线当天就用上面的 `base_score` 形态做即时验证。
 
 ---
 
