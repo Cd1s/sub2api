@@ -9,6 +9,7 @@
 |---|---|---|
 | `v0.2.4-ours` | 上游 `v0.2.4`（`5de5e2be`） | 登记制组内分档（本组按 priority 推断） |
 | `v0.2.4-ours.2` | 同上 | 本组改为显式标记；本组健康门控降级 + 防饿死探测；会话自动回家（取代外部定时器）；管理端快照按组；后台「加入号池动态调度」开关 |
+| `v0.2.4-ours.3` | 同上 | 修复：调度快照缓存白名单漏了 `ours_*` 两个键，路由看不到登记（见挂钩点 G） |
 
 分支：`ours/scheduler-patch`（**fork 的默认分支**）。`main` 只镜像上游，永远不放补丁。
 不要点 GitHub 上的「Sync fork」按钮——它会把上游 merge 进补丁分支；同步上游一律用 `ours/rebase.sh`。
@@ -128,12 +129,27 @@
 | **B 真实路由** | `buildOpenAIAccountLoadPlan()` `:906`，及其后两处 | `tiers := openAIPlanTiers(req, candidates)`；两处 `openAISchedulingPriorityFor(x, tiers)` |
 | **C 诊断快照** | 权重视图结构体 `:2623` 字段 `oursGroupID`；`RateLimitService.BuildOpenAIAccountSchedulerScoreSnapshot` `:2660`；`buildOpenAIAccountSchedulerScoreSnapshot()` `:2705` | 管理端按组打分时把分组经 ctx → 权重视图带进快照；`tiers := oursSnapshotTiers(accounts, weights)` |
 | **C′ 管理端** | `handler/admin/account_handler.go:563` `scoreGroupPool` | `service.OursWithSchedulerScoreGroup(ctx, groupID)` |
+| **G 快照缓存白名单** | `repository/scheduler_cache.go:956` `filterSchedulerCredentials` | 白名单加 `ours_tiering`、`ours_home_groups`（分组名单从 `sched:meta:<id>` 读，漏了这两个键路由就看不到登记） |
 | **D tie-break** | `isOpenAIAccountCandidateBetter()` `:698` | `openAICandidateOrderingPriority(left/right)` |
 | **E 会话回家** | `Select()` `:452-454` | `if selection, ok := s.oursTryReturnHome(ctx, req, &decision); ok { return ... }` |
 | **F 静默逃逸日志** | `selectBySessionHash()` `:565`、`:590` | `slog.Info("sticky_escape_triggered", …)` → `oursStickyEscapeInfo(req)("sticky_escape_triggered", …)` |
 | 前端开关 | `EditAccountModal.vue` | 「加入号池动态调度」开关读写 `credentials.ours_tiering`；中英文案在 `i18n/locales/*/admin/accounts.ts` |
 
 上游 Go 文件相对 v0.2.4-ours 净新增 5 行（`oursQuietEscape`、回家挂钩 3 行、`oursGroupID`），其余是单行替换。
+
+### 挂钩点 G 的教训（v0.2.4-ours.3 修复）
+
+调度快照缓存只保留一份白名单里的 credentials 键（`filterSchedulerCredentials`）。分组名单（`listSchedulableAccounts`）
+从缓存的 `sched:meta:<id>` 读，所以 **v0.2.4-ours 与 v0.2.4-ours.2 在生产上，路由基本看不到 `ours_tiering` / `ours_home_groups`**：
+分档、健康降级、本组表、会话回家只在缓存失效回源读库的少数请求上生效。管理端 `scheduler_scores` 走的是直接读库的路径，
+照样显示正确，所以它**不能**用来证明路由已经生效；单测里的仓储也不经过这层缓存。
+
+现在由仓储层单测 `TestOursSchedulerMetadata*` 守住白名单。上线后验证路由是否真的看到登记，看这两样：
+
+- 缓存：`sched:meta:<id>` 里含 `ours_tiering` 与 `ours_home_groups` 两个键名（只数键名，不要打印值）；
+- 行为：本组出错时出现 `ours_primary_demoted`，会话离开本组满 600 秒后出现 `ours_sticky_returned_home`。
+
+白名单改动只在账号缓存被重写时生效（账号有写入、或快照重建）；部署后要让登记账号各被写一次，或等快照重建。
 
 **没有碰的东西**：打分公式段、旧调度路径、`gateway_scheduling.go`、`openAIAccountRuntimeStat`、`account_groups.priority`、任何 settings 键、数据库迁移。
 
@@ -301,4 +317,5 @@ gh api repos/Cd1s/sub2api/actions/workflows --jq '.workflows[] | "\(.path)\t\(.s
 | `TestOursOffHomeTable_ExpiryAndCap` / `TestOursGroupHomeTable_*` | 计时表过期与上限、本组表黏住语义 |
 | `TestBuildOpenAIAccountLoadPlan_*` | 挂钩 A、B：真实路由按档打分，本组出池后备用仍同档 |
 | `TestIsOpenAIAccountCandidateBetter_*` | 挂钩 D：同档按 LoadRate、零值回落 |
+| `TestOursSchedulerMetadata*`（repository 包） | 挂钩 G：调度快照缓存保留 `ours_*`，且不放进 token |
 | `EditAccountModal.oursTiering.spec.ts` | 前端开关读写 `ours_tiering`，不碰其它 credentials 键 |

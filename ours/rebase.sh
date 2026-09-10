@@ -49,6 +49,7 @@ HOOKS=(
   "backend/internal/service/openai_account_scheduler.go|1|oursWeightsWithScoreGroup\(ctx, gateway\.openAIWSSchedulerWeightsForRequest\(ctx\)\)"
   "backend/internal/service/openai_account_scheduler.go|1|tiers := oursSnapshotTiers\(accounts, weights\)"
   "backend/internal/handler/admin/account_handler.go|1|service\.OursWithSchedulerScoreGroup\(ctx, groupID\)"
+  "backend/internal/repository/scheduler_cache.go|1|\"ours_tiering\", \"ours_home_groups\"\}"
   "frontend/src/components/account/EditAccountModal.vue|1|data-testid=\"ours-tiering-toggle\""
 )
 
