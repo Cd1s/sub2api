@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"testing"
@@ -111,54 +112,155 @@ func oursHealthTestScheduler(escapeEnabled bool, errorRateThreshold float64) *de
 	return &defaultOpenAIAccountScheduler{service: &OpenAIGatewayService{cfg: cfg}, stats: newOpenAIAccountRuntimeStats()}
 }
 
-// 组 7：本组 1，备用 2、3，兜底 4。
-func oursHealthRoster() []Account {
-	return []Account{
-		*enrolledAccount(1, 50, 7),
-		*enrolledAccount(2, 50),
-		*enrolledAccount(3, 50),
-		*enrolledAccount(4, 998),
-	}
-}
-
 func reportFailures(stats *openAIAccountRuntimeStats, accountID int64, n int) {
 	for i := 0; i < n; i++ {
 		stats.report(accountID, false, nil)
 	}
 }
 
-// ---------------------------------------------------------------- 健康降级
+// ---------------------------------------------------------------- 路由档位：健康降级 + 会话固定备用 + 滞回
+
+// oursRouteRoster：组 7，本组 1，备用 2..8（7 个），兜底 9。
+func oursRouteRoster() []Account {
+	roster := []Account{*enrolledAccount(1, 50, 7)}
+	for id := int64(2); id <= 8; id++ {
+		roster = append(roster, *enrolledAccount(id, 50))
+	}
+	return append(roster, *enrolledAccount(9, 998))
+}
+
+func oursRouteReq(session string) OpenAIAccountScheduleRequest {
+	return OpenAIAccountScheduleRequest{GroupID: int64Ptr(7), SessionHash: session}
+}
+
+func designatedOf(tiers map[int64]int) (int64, int) {
+	var id int64
+	n := 0
+	for accountID, tier := range tiers {
+		if tier == oursRouteDesignated {
+			id, n = accountID, n+1
+		}
+	}
+	return id, n
+}
+
+func TestOursRouteTiers_HealthyHomeOnTopAndNoSessionKeepsBackupsEqual(t *testing.T) {
+	withGroupTiering(t, true)
+	scheduler := oursHealthTestScheduler(true, 0.5)
+	tiers := scheduler.oursRosterTiers(oursRouteReq(""), oursRouteRoster())
+	require.Equal(t, oursRouteHome, tiers[1])
+	for id := int64(2); id <= 8; id++ {
+		require.Equalf(t, oursRouteHealthy, tiers[id], "无会话时健康备用同档：%d", id)
+	}
+	require.Equal(t, oursRouteFallback, tiers[9])
+}
+
+func TestOursRouteTiers_EachSessionGetsOneStableDesignatedBackup(t *testing.T) {
+	withGroupTiering(t, true)
+	scheduler := oursHealthTestScheduler(true, 0.5)
+	first := scheduler.oursRosterTiers(oursRouteReq("sess-a"), oursRouteRoster())
+	designated, n := designatedOf(first)
+	require.Equal(t, 1, n, "每个会话恰好一个固定备用")
+	require.NotEqual(t, int64(1), designated, "本组不是固定备用")
+	require.NotEqual(t, int64(9), designated, "兜底不是固定备用")
+	require.Equal(t, oursRouteHome, first[1], "本组健康时仍排第一")
+	for i := 0; i < 20; i++ {
+		again, _ := designatedOf(scheduler.oursRosterTiers(oursRouteReq("sess-a"), oursRouteRoster()))
+		require.Equal(t, designated, again, "同一会话每次都是同一个固定备用")
+	}
+}
+
+func TestOursRouteTiers_DesignationSpreadsSessionsEvenly(t *testing.T) {
+	withGroupTiering(t, true)
+	scheduler := oursHealthTestScheduler(true, 0.5)
+	counts := map[int64]int{}
+	const sessions = 7000
+	for i := 0; i < sessions; i++ {
+		id, _ := designatedOf(scheduler.oursRosterTiers(oursRouteReq(fmt.Sprintf("%032x", i*7919+13)), oursRouteRoster()))
+		counts[id]++
+	}
+	require.Len(t, counts, 7)
+	for id, n := range counts {
+		require.InDeltaf(t, sessions/7, n, sessions/7*0.15, "备用 %d 分到 %d 个会话，偏离均值超过 15%%", id, n)
+	}
+}
+
+func TestOursRouteTiers_UnhealthyDesignatedMovesOnlyItsSessions(t *testing.T) {
+	withGroupTiering(t, true)
+	scheduler := oursHealthTestScheduler(true, 0.5)
+	before := map[string]int64{}
+	for i := 0; i < 2000; i++ {
+		session := fmt.Sprintf("s-%d", i)
+		before[session], _ = designatedOf(scheduler.oursRosterTiers(oursRouteReq(session), oursRouteRoster()))
+	}
+	reportFailures(scheduler.stats, 4, 4) // 备用 4 变得不健康（0.5904）
+
+	moved, kept := 0, 0
+	for session, old := range before {
+		now, _ := designatedOf(scheduler.oursRosterTiers(oursRouteReq(session), oursRouteRoster()))
+		require.NotEqual(t, int64(4), now, "不健康的备用不再被选为固定备用")
+		if old == 4 {
+			moved++
+		} else {
+			require.Equalf(t, old, now, "会话 %s 原本不在 4 上，不得换号", session)
+			kept++
+		}
+	}
+	require.Greater(t, moved, 0)
+	require.Greater(t, kept, 0)
+	tiers := scheduler.oursRosterTiers(oursRouteReq(""), oursRouteRoster())
+	require.Equal(t, oursRouteUnhealthy, tiers[4], "不健康备用排在健康备用之后")
+}
+
+func TestOursRouteTiers_ExcludedDesignatedFallsToStableNextChoice(t *testing.T) {
+	withGroupTiering(t, true)
+	scheduler := oursHealthTestScheduler(true, 0.5)
+	first, _ := designatedOf(scheduler.oursRosterTiers(oursRouteReq("sess-x"), oursRouteRoster()))
+	req := oursRouteReq("sess-x")
+	req.ExcludedIDs = map[int64]struct{}{first: {}}
+	second, n := designatedOf(scheduler.oursRosterTiers(req, oursRouteRoster()))
+	require.Equal(t, 1, n)
+	require.NotEqual(t, first, second)
+	for i := 0; i < 10; i++ {
+		again, _ := designatedOf(scheduler.oursRosterTiers(req, oursRouteRoster()))
+		require.Equal(t, second, again, "failover 时下一个选择也是确定的")
+	}
+}
+
+func TestOursRouteTiers_AllBackupsUnhealthyStillPinsSessionAndKeepsHome(t *testing.T) {
+	withGroupTiering(t, true)
+	withProbeEvery(t, 0)
+	scheduler := oursHealthTestScheduler(true, 0.5)
+	for id := int64(1); id <= 8; id++ {
+		reportFailures(scheduler.stats, id, 4)
+	}
+	tiers := scheduler.oursRosterTiers(oursRouteReq("sess-storm"), oursRouteRoster())
+	require.Equal(t, oursRouteHome, tiers[1], "没有健康备用可让时本组不让位（保缓存）")
+	designated, n := designatedOf(tiers)
+	require.Equal(t, 1, n, "全局风暴时仍给会话固定一个备用，不追着最不差的号跑")
+	again, _ := designatedOf(scheduler.oursRosterTiers(oursRouteReq("sess-storm"), oursRouteRoster()))
+	require.Equal(t, designated, again)
+}
 
 // EWMA(alpha=0.2) 从 0 起连续失败：0.2、0.36、0.488、0.5904。
-func TestOursPrimaryHealth_BelowThresholdKeepsPrimary(t *testing.T) {
+func TestOursPrimaryHealth_BelowThresholdKeepsHome(t *testing.T) {
 	withGroupTiering(t, true)
 	scheduler := oursHealthTestScheduler(true, 0.5)
 	reportFailures(scheduler.stats, 1, 3) // 0.488 < 0.5
-
-	tiers := scheduler.oursRosterTiers(OpenAIAccountScheduleRequest{GroupID: int64Ptr(7)}, oursHealthRoster())
-	require.Equal(t, oursTierPrimary, tiers[1])
+	require.Equal(t, oursRouteHome, scheduler.oursRosterTiers(oursRouteReq("s"), oursRouteRoster())[1])
 }
 
-func TestOursPrimaryHealth_AboveThresholdDemotesOnlyPrimary(t *testing.T) {
+func TestOursPrimaryHealth_AboveThresholdYieldsToDesignatedBackup(t *testing.T) {
 	withGroupTiering(t, true)
 	withProbeEvery(t, 0)
 	scheduler := oursHealthTestScheduler(true, 0.5)
 	reportFailures(scheduler.stats, 1, 4) // 0.5904 > 0.5
 
-	tiers := scheduler.oursRosterTiers(OpenAIAccountScheduleRequest{GroupID: int64Ptr(7)}, oursHealthRoster())
-	require.Equal(t, map[int64]int{1: oursTierBackup, 2: oursTierBackup, 3: oursTierBackup, 4: oursTierFallback}, tiers)
-}
-
-func TestOursPrimaryHealth_ReturnsNewMapWithoutMutatingInput(t *testing.T) {
-	withGroupTiering(t, true)
-	withProbeEvery(t, 0)
-	scheduler := oursHealthTestScheduler(true, 0.5)
-	reportFailures(scheduler.stats, 1, 4)
-
-	original := map[int64]int{1: oursTierPrimary, 2: oursTierBackup}
-	adjusted := scheduler.oursApplyPrimaryHealth(scheduler.oursState(), OpenAIAccountScheduleRequest{}, original)
-	require.Equal(t, oursTierBackup, adjusted[1])
-	require.Equal(t, oursTierPrimary, original[1], "不得原地改名单档位表")
+	tiers := scheduler.oursRosterTiers(oursRouteReq("s"), oursRouteRoster())
+	require.Equal(t, oursRouteUnhealthy, tiers[1])
+	_, n := designatedOf(tiers)
+	require.Equal(t, 1, n)
+	require.Equal(t, oursRouteFallback, tiers[9], "兜底仍在备用之后")
 }
 
 func TestOursPrimaryHealth_EqualToThresholdDoesNotDemote(t *testing.T) {
@@ -166,11 +268,9 @@ func TestOursPrimaryHealth_EqualToThresholdDoesNotDemote(t *testing.T) {
 	withProbeEvery(t, 0)
 	scheduler := oursHealthTestScheduler(true, 0.2)
 	reportFailures(scheduler.stats, 1, 1) // 恰好 0.2
-
 	errorRate, _, _ := scheduler.stats.snapshot(1)
 	require.InDelta(t, 0.2, errorRate, 1e-12)
-	tiers := scheduler.oursRosterTiers(OpenAIAccountScheduleRequest{GroupID: int64Ptr(7)}, oursHealthRoster())
-	require.Equal(t, oursTierPrimary, tiers[1], "与 shouldEscapeStickyAccount 一致：只有大于阈值才降级")
+	require.Equal(t, oursRouteHome, scheduler.oursRosterTiers(oursRouteReq("s"), oursRouteRoster())[1])
 }
 
 func TestOursPrimaryHealth_OnlyErrorRateCountsNotTTFT(t *testing.T) {
@@ -179,14 +279,9 @@ func TestOursPrimaryHealth_OnlyErrorRateCountsNotTTFT(t *testing.T) {
 	scheduler := oursHealthTestScheduler(true, 0.5)
 	slow := 60000
 	for i := 0; i < 5; i++ {
-		scheduler.stats.report(1, true, &slow) // 首字 60s，远超 15s，但全部成功
+		scheduler.stats.report(1, true, &slow)
 	}
-	_, ttft, hasTTFT := scheduler.stats.snapshot(1)
-	require.True(t, hasTTFT)
-	require.Greater(t, ttft, 15000.0)
-
-	tiers := scheduler.oursRosterTiers(OpenAIAccountScheduleRequest{GroupID: int64Ptr(7)}, oursHealthRoster())
-	require.Equal(t, oursTierPrimary, tiers[1])
+	require.Equal(t, oursRouteHome, scheduler.oursRosterTiers(oursRouteReq("s"), oursRouteRoster())[1])
 }
 
 func TestOursPrimaryHealth_EscapeDisabledNeverDemotes(t *testing.T) {
@@ -194,56 +289,80 @@ func TestOursPrimaryHealth_EscapeDisabledNeverDemotes(t *testing.T) {
 	withProbeEvery(t, 0)
 	scheduler := oursHealthTestScheduler(false, 0.5)
 	reportFailures(scheduler.stats, 1, 10)
-
-	tiers := scheduler.oursRosterTiers(OpenAIAccountScheduleRequest{GroupID: int64Ptr(7)}, oursHealthRoster())
-	require.Equal(t, oursTierPrimary, tiers[1])
+	require.Equal(t, oursRouteHome, scheduler.oursRosterTiers(oursRouteReq("s"), oursRouteRoster())[1])
 }
 
-// 降级后本组与备用同档，健康的备用靠 W_error_rate 胜出。
-func TestOursPrimaryHealth_DemotedPrimaryLosesToHealthyBackup(t *testing.T) {
+// 滞回：超过 0.5 才降级，回落到 0.3（0.5 × 0.6）以下才恢复；切换日志各打一次。
+func TestOursPrimaryHealth_HysteresisAndTransitionLogs(t *testing.T) {
+	withGroupTiering(t, true)
+	withProbeEvery(t, 0)
+	logs := captureOursLogs(t)
+	scheduler := oursHealthTestScheduler(true, 0.5)
+	homeTier := func() int { return scheduler.oursRosterTiers(oursRouteReq("s"), oursRouteRoster())[1] }
+
+	require.Equal(t, oursRouteHome, homeTier())
+	reportFailures(scheduler.stats, 1, 4) // 0.5904
+	require.Equal(t, oursRouteUnhealthy, homeTier())
+	for _, want := range []float64{0.47232, 0.377856, 0.3022848} { // 仍 >= 0.3：保持降级
+		scheduler.stats.report(1, true, nil)
+		errorRate, _, _ := scheduler.stats.snapshot(1)
+		require.InDelta(t, want, errorRate, 1e-9)
+		require.Equalf(t, oursRouteUnhealthy, homeTier(), "错误率 %.4f 仍在滞回区间，不恢复", errorRate)
+	}
+	scheduler.stats.report(1, true, nil) // 0.2418 < 0.3
+	require.Equal(t, oursRouteHome, homeTier())
+	require.Equal(t, oursRouteHome, homeTier())
+
+	require.Equal(t, 1, logs.count("ours_primary_demoted"))
+	require.Equal(t, 1, logs.count("ours_primary_restored"))
+	record, _ := logs.last("ours_primary_demoted")
+	require.EqualValues(t, 1, record.attrs["account_id"])
+	require.InDelta(t, 0.5, record.attrs["threshold"], 1e-12)
+}
+
+func TestOursNextUnhealthy(t *testing.T) {
+	require.False(t, oursNextUnhealthy(false, 0.5, 0.5))
+	require.True(t, oursNextUnhealthy(false, 0.51, 0.5))
+	require.True(t, oursNextUnhealthy(true, 0.3, 0.5), "恰好 0.3 仍不恢复")
+	require.False(t, oursNextUnhealthy(true, 0.29, 0.5))
+	require.True(t, oursNextUnhealthy(true, 0.45, 0.5))
+}
+
+// 降级后固定备用的分数领先其它健康备用超过一个错误率满分（500），错误率不会把顺序打乱。
+func TestOursRouteTiers_PlanScoresKeepTierOrderOverErrorTerm(t *testing.T) {
 	withGroupTiering(t, true)
 	withProbeEvery(t, 0)
 	scheduler := oursHealthTestScheduler(true, 0.5)
 	reportFailures(scheduler.stats, 1, 4)
-
-	roster := oursHealthRoster()
-	req := OpenAIAccountScheduleRequest{GroupID: int64Ptr(7)}
+	roster := oursRouteRoster()
+	req := oursRouteReq("sess-plan")
 	req.oursTiers = scheduler.oursRosterTiers(req, roster)
-	pool := []*Account{&roster[0], &roster[1], &roster[2], &roster[3]}
-	plan := scheduler.buildOpenAIAccountLoadPlan(context.Background(), req, pool, map[int64]*AccountLoadInfo{})
-	scores := openAIPlanScores(plan)
-
-	errorRate, _, _ := scheduler.stats.snapshot(1)
-	require.Greater(t, scores[2], scores[1])
-	require.InDelta(t, 500*errorRate, scores[2]-scores[1], 1e-6, "分差完全来自 W_error_rate")
+	designated, _ := designatedOf(req.oursTiers)
+	pool := make([]*Account, 0, len(roster))
+	for i := range roster {
+		pool = append(pool, &roster[i])
+	}
+	scores := openAIPlanScores(scheduler.buildOpenAIAccountLoadPlan(context.Background(), req, pool, map[int64]*AccountLoadInfo{}))
+	for id, score := range scores {
+		if id == designated {
+			continue
+		}
+		require.Greaterf(t, scores[designated]-score, 500.0, "固定备用必须领先账号 %d 超过 500 分", id)
+	}
 }
 
-func TestOursPrimaryHealth_ProbeKeepsPrimaryExactlyOncePerN(t *testing.T) {
+func TestOursPrimaryHealth_ProbeKeepsHomeExactlyOncePerN(t *testing.T) {
 	withGroupTiering(t, true)
 	withProbeEvery(t, 5)
 	scheduler := oursHealthTestScheduler(true, 0.5)
 	reportFailures(scheduler.stats, 1, 4)
-
-	var primaryRounds []int
+	var homeRounds []int
 	for i := 1; i <= 20; i++ {
-		tiers := scheduler.oursRosterTiers(OpenAIAccountScheduleRequest{GroupID: int64Ptr(7)}, oursHealthRoster())
-		if tiers[1] == oursTierPrimary {
-			primaryRounds = append(primaryRounds, i)
+		if scheduler.oursRosterTiers(oursRouteReq("s"), oursRouteRoster())[1] == oursRouteHome {
+			homeRounds = append(homeRounds, i)
 		}
 	}
-	require.Equal(t, []int{5, 10, 15, 20}, primaryRounds, "任意连续 5 次选号中恰好 1 次保持档 1")
-}
-
-func TestOursPrimaryHealth_ProbeDisabledNeverKeepsPrimary(t *testing.T) {
-	withGroupTiering(t, true)
-	withProbeEvery(t, 0)
-	scheduler := oursHealthTestScheduler(true, 0.5)
-	reportFailures(scheduler.stats, 1, 4)
-
-	for i := 0; i < 50; i++ {
-		tiers := scheduler.oursRosterTiers(OpenAIAccountScheduleRequest{GroupID: int64Ptr(7)}, oursHealthRoster())
-		require.Equal(t, oursTierBackup, tiers[1])
-	}
+	require.Equal(t, []int{5, 10, 15, 20}, homeRounds)
 }
 
 func TestOursPrimaryHealth_ExcludedPrimaryDoesNotConsumeProbe(t *testing.T) {
@@ -251,46 +370,13 @@ func TestOursPrimaryHealth_ExcludedPrimaryDoesNotConsumeProbe(t *testing.T) {
 	withProbeEvery(t, 2)
 	scheduler := oursHealthTestScheduler(true, 0.5)
 	reportFailures(scheduler.stats, 1, 4)
-
-	excluded := OpenAIAccountScheduleRequest{GroupID: int64Ptr(7), ExcludedIDs: map[int64]struct{}{1: {}}}
+	excluded := oursRouteReq("s")
+	excluded.ExcludedIDs = map[int64]struct{}{1: {}}
 	for i := 0; i < 5; i++ {
-		scheduler.oursRosterTiers(excluded, oursHealthRoster())
+		scheduler.oursRosterTiers(excluded, oursRouteRoster())
 	}
-	normal := OpenAIAccountScheduleRequest{GroupID: int64Ptr(7)}
-	require.Equal(t, oursTierBackup, scheduler.oursRosterTiers(normal, oursHealthRoster())[1], "第 1 次（未被排除计入）")
-	require.Equal(t, oursTierPrimary, scheduler.oursRosterTiers(normal, oursHealthRoster())[1], "第 2 次是探测")
-}
-
-func TestOursPrimaryHealth_RecoveryRestoresPrimaryAndLogsTransitionsOnce(t *testing.T) {
-	withGroupTiering(t, true)
-	withProbeEvery(t, 0)
-	logs := captureOursLogs(t)
-	scheduler := oursHealthTestScheduler(true, 0.5)
-	req := OpenAIAccountScheduleRequest{GroupID: int64Ptr(7)}
-
-	require.Equal(t, oursTierPrimary, scheduler.oursRosterTiers(req, oursHealthRoster())[1])
-	require.Zero(t, logs.count("ours_primary_restored"), "从未降级过就不打 restored")
-
-	reportFailures(scheduler.stats, 1, 4)
-	for i := 0; i < 3; i++ {
-		require.Equal(t, oursTierBackup, scheduler.oursRosterTiers(req, oursHealthRoster())[1])
-	}
-	require.Equal(t, 1, logs.count("ours_primary_demoted"))
-	record, ok := logs.last("ours_primary_demoted")
-	require.True(t, ok)
-	require.EqualValues(t, 1, record.attrs["account_id"])
-	require.InDelta(t, 0.5, record.attrs["threshold"], 1e-12)
-
-	for i := 0; i < 5; i++ {
-		scheduler.stats.report(1, true, nil)
-	}
-	errorRate, _, _ := scheduler.stats.snapshot(1)
-	require.Less(t, errorRate, 0.5)
-	for i := 0; i < 3; i++ {
-		require.Equal(t, oursTierPrimary, scheduler.oursRosterTiers(req, oursHealthRoster())[1])
-	}
-	require.Equal(t, 1, logs.count("ours_primary_demoted"))
-	require.Equal(t, 1, logs.count("ours_primary_restored"))
+	require.Equal(t, oursRouteUnhealthy, scheduler.oursRosterTiers(oursRouteReq("s"), oursRouteRoster())[1], "第 1 次")
+	require.Equal(t, oursRouteHome, scheduler.oursRosterTiers(oursRouteReq("s"), oursRouteRoster())[1], "第 2 次是探测")
 }
 
 // ---------------------------------------------------------------- 本组表（黏住版）
@@ -431,6 +517,9 @@ func newOursHomeFixture(t *testing.T, accounts []Account) *oursHomeFixture {
 	withProbeEvery(t, 0)
 	cfg := &config.Config{}
 	oursEscapeConfig(cfg, true, 0.5)
+	// 线上调度设置：W_priority=10000、W_error_rate=500、其余 0，lb_top_k=2。档位设计依赖这组权重。
+	cfg.Gateway.OpenAIWS.SchedulerScoreWeights = config.GatewayOpenAIWSSchedulerScoreWeights{Priority: 10000, ErrorRate: 500}
+	cfg.Gateway.OpenAIWS.LBTopK = 2
 	cfg.Gateway.OpenAIWS.Enabled = true
 	cfg.Gateway.OpenAIWS.APIKeyEnabled = true
 	cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
@@ -710,6 +799,25 @@ func TestOursReturnHome_ProfitGateStillRebindsToHome(t *testing.T) {
 			require.Equal(t, tc.wantID, selection.Account.ID)
 			require.Equal(t, tc.wantID, f.cache.sessionBindings[oursSessionKeyR])
 		})
+	}
+}
+
+// 端到端：会话绑在不健康的本组上，连续请求都落到同一个固定备用，不在备用之间来回跳。
+func TestOursRoute_UnhealthyHomeSessionPinsToOneBackupEndToEnd(t *testing.T) {
+	f := newOursHomeFixture(t, oursDefaultHomeAccounts())
+	f.seedHomeTable(t)
+	f.bindSessionTo(oursHomeID)
+	reportFailures(f.svc.openaiAccountStats, oursHomeID, 4)
+
+	var picked []int64
+	for i := 0; i < 8; i++ {
+		selection, _ := f.selectFor(t, context.Background(), "", oursSessionHash, "gpt-5.1")
+		picked = append(picked, selection.Account.ID)
+	}
+	require.NotEqual(t, oursHomeID, picked[0], "本组不健康时让位")
+	require.NotEqual(t, oursMonocleID, picked[0], "有健康备用时不落兜底")
+	for _, id := range picked {
+		require.Equal(t, picked[0], id, "同一会话每次都落在同一个固定备用上")
 	}
 }
 

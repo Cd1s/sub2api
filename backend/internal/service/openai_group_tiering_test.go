@@ -354,7 +354,7 @@ func TestBuildOpenAIAccountLoadPlan_EnrolledAccountsUseTiers(t *testing.T) {
 	plan := openAITieringTestScheduler().buildOpenAIAccountLoadPlan(
 		context.Background(), OpenAIAccountScheduleRequest{GroupID: int64Ptr(7)}, filtered, map[int64]*AccountLoadInfo{},
 	)
-	require.Equal(t, map[int64]int{1: oursTierPrimary, 2: oursTierBackup, 3: oursTierBackup, 4: oursTierFallback}, openAIPlanPriorities(plan))
+	require.Equal(t, map[int64]int{1: oursRouteHome, 2: oursRouteHealthy, 3: oursRouteHealthy, 4: oursRouteFallback}, openAIPlanPriorities(plan))
 
 	scores := openAIPlanScores(plan)
 	require.InDelta(t, 10000.0, scores[1], 1e-6, "本组 pf = 1.0")
@@ -413,8 +413,8 @@ func TestBuildOpenAIAccountLoadPlan_RosterTiersSurviveExclusion(t *testing.T) {
 		5: {AccountID: 5},
 	}
 	plan := scheduler.buildOpenAIAccountLoadPlan(context.Background(), req, pool, loadMap)
-	require.Equal(t, map[int64]int{2: oursTierBackup, 3: oursTierBackup, 4: oursTierBackup, 5: oursTierFallback},
-		openAIPlanPriorities(plan), "本组出池不得让备用顶替成档 1")
+	require.Equal(t, map[int64]int{2: oursRouteHealthy, 3: oursRouteHealthy, 4: oursRouteHealthy, 5: oursRouteFallback},
+		openAIPlanPriorities(plan), "本组出池不得让备用顶替成本组")
 
 	scores := openAIPlanScores(plan)
 	require.InDelta(t, scores[2], scores[3], 1e-9)

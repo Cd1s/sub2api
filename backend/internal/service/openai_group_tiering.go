@@ -20,8 +20,9 @@ import (
 // 所有 Pro 账号可以绑进所有分组而不会让 priority 最小的那个吃掉全站流量。
 //
 // 实现方式：不新增数据库字段，只在高级调度器内把候选的「调度用 priority」从全局
-// accounts.priority 换成组内档位（见 oursGroupTiers）。档位相同的账号打分相同，
-// 上游现成的 tie-break 会落到 LoadRate 低者优先——这就是「按当前负载分散」。
+// accounts.priority 换成组内档位。oursGroupTiers 是按组的基础档位（管理端快照也用它）；
+// 真实路由在其上按健康状态和会话再细分（见 ours_health_home.go 的 oursRouteTiers）：
+// 本组不可用时，每个会话固定落到一个健康备用上，不同会话均匀分散。
 //
 // 池内没有任何登记账号时返回 nil，调用方回落上游原逻辑，行为与上游完全一致。
 
@@ -279,7 +280,7 @@ func openAIPlanTiers(req OpenAIAccountScheduleRequest, candidates []openAIAccoun
 	for i := range candidates {
 		accounts = append(accounts, candidates[i].account)
 	}
-	return oursGroupTiers(accounts, req.GroupID)
+	return oursRouteTiersFromBase(oursGroupTiers(accounts, req.GroupID))
 }
 
 // openAISchedulingPriorityFor 是 openAIAccountSchedulingPriority 的分档版本：

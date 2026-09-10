@@ -13,8 +13,10 @@ import (
 
 // fork 私有补丁（v0.2.4-ours.2）：本组健康门控降级 + 防饿死探测 + 会话自动回家。
 //
-//   - 健康降级：本组（档 1）账号的运行时错误率超过 sticky_escape 的错误率阈值时，本次选号
-//     把它降为档 2，由现有的 W_error_rate 在它和备用之间挑更健康的。只看错误率，不看首字延迟。
+//   - 健康降级：本组账号的运行时错误率超过 sticky_escape 的错误率阈值、且存在健康备用时，
+//     本次选号让位给该会话的固定备用。只看错误率，不看首字延迟；带滞回（v0.2.4-ours.4）。
+//   - 会话固定备用：本组不可用时，按「会话 × 账号」哈希从健康备用里固定选一个（v0.2.4-ours.4），
+//     溢出在备用之间均匀分散、同一会话始终落在同一个备用上，不再扎堆也不再在备用之间来回跳。
 //   - 防饿死探测：被降级的本组每第 N 次选号仍按档 1 参与一次，让错误率 EWMA 有机会回落。
 //   - 会话回家：会话绑在非本组账号满 RETURN_AFTER 秒、且本组健康有余量时，下一次请求把它
 //     改绑回本组。取代外部的 sub2api-cascade-sticky-expire 定时器。
@@ -57,9 +59,10 @@ func oursParseNonNegativeIntEnv(raw string, fallback int) int {
 // ---------------------------------------------------------------- 状态
 
 type oursSchedulerState struct {
-	demoted sync.Map // accountID int64 -> *atomic.Bool（本组是否处于降级状态，只用于切换日志）
-	probes  sync.Map // accountID int64 -> *atomic.Uint64（降级期间的选号计数，决定探测轮次）
-	homes   sync.Map // groupID int64 -> *oursGroupHome
+	demoted   sync.Map // accountID int64 -> *atomic.Bool（本组降级状态，带滞回，切换时打日志）
+	unhealthy sync.Map // accountID int64 -> *atomic.Bool（备用不健康状态，带滞回，不打日志）
+	probes    sync.Map // accountID int64 -> *atomic.Uint64（降级期间的选号计数，决定探测轮次）
+	homes     sync.Map // groupID int64 -> *oursGroupHome
 
 	offHome      sync.Map // oursSessionKey -> *oursOffHomeEntry
 	offHomeCount atomic.Int64
@@ -128,8 +131,31 @@ func (s *defaultOpenAIAccountScheduler) oursStickyTTL() time.Duration {
 
 // ---------------------------------------------------------------- 档位 + 健康降级（挂钩 A）
 
+// 路由用档位（按会话细分）。数值越小越优先，全部 > 0；各档之间在 W_priority=10000 下
+// 至少差约 2000 分，远大于错误率项（最多 500 分），错误率只在同档内起作用。
+const (
+	oursRouteHome       = 1 // 本组（健康；或不健康但没有健康备用可让；或降级期间的探测轮次）
+	oursRouteDesignated = 2 // 该会话的固定备用：健康备用里按会话哈希选出，同一会话始终是同一个
+	oursRouteHealthy    = 3 // 其它健康备用
+	oursRouteUnhealthy  = 4 // 不健康的备用、让位中的本组
+	oursRouteFallback   = 5 // 兜底
+	oursRouteUnenrolled = 6 // 未登记
+)
+
+// oursRestoreRatio 是健康判定的滞回：错误率超过阈值才判为不健康，回落到「阈值 × 0.6」以下才恢复，
+// 中间保持原状态。错误率 EWMA（alpha=0.2）四次失败就能越过 0.5，没有滞回会来回摆动。
+const oursRestoreRatio = 0.6
+
+// oursNextUnhealthy 按滞回规则计算下一个健康状态。
+func oursNextUnhealthy(prevUnhealthy bool, errorRate, threshold float64) bool {
+	if prevUnhealthy {
+		return errorRate >= threshold*oursRestoreRatio
+	}
+	return errorRate > threshold
+}
+
 // oursRosterTiers 在分组完整名单（failover 排除与运行时封禁之前）上计算本次选号用的档位表：
-// 先按本组标记分档，顺手刷新本组表，再对档 1 做健康降级。返回新 map，不改原始档位表。
+// 先按本组标记分档、刷新本组表，再按健康状态与会话固定备用细分。返回新 map。
 func (s *defaultOpenAIAccountScheduler) oursRosterTiers(req OpenAIAccountScheduleRequest, roster []Account) map[int64]int {
 	if !oursGroupTieringEnabled || len(roster) == 0 {
 		return nil
@@ -138,71 +164,192 @@ func (s *defaultOpenAIAccountScheduler) oursRosterTiers(req OpenAIAccountSchedul
 	for i := range roster {
 		accounts = append(accounts, &roster[i])
 	}
-	if s == nil {
-		return oursGroupTiers(accounts, req.GroupID)
+	base := oursGroupTiers(accounts, req.GroupID)
+	if s == nil || base == nil {
+		return oursRouteTiersFromBase(base)
 	}
 	state := s.oursState()
 	if req.GroupID != nil {
 		state.observeHomes(*req.GroupID, accounts, oursNow(), s.oursStickyTTL())
 	}
-	tiers := oursGroupTiers(accounts, req.GroupID)
-	return s.oursApplyPrimaryHealth(state, req, tiers)
+	return s.oursRouteTiers(state, req, accounts, base)
 }
 
-func (s *defaultOpenAIAccountScheduler) oursApplyPrimaryHealth(state *oursSchedulerState, req OpenAIAccountScheduleRequest, tiers map[int64]int) map[int64]int {
-	if tiers == nil || s.stats == nil || s.service == nil {
-		return tiers
+// oursRouteTiersFromBase 把按组的基础档位映射成路由档位（不看健康、不看会话）：
+// 本组 1、备用 3、兜底 5、未登记 6。管理端快照也用它，保证无会话、全健康时与真实路由一致。
+func oursRouteTiersFromBase(base map[int64]int) map[int64]int {
+	if base == nil {
+		return nil
 	}
-	cfg := s.service.openAIStickyEscapeConfig()
-	var adjusted map[int64]int
-	for accountID, tier := range tiers {
-		if tier != oursTierPrimary {
-			continue
+	out := make(map[int64]int, len(base))
+	for id, tier := range base {
+		switch tier {
+		case oursTierPrimary:
+			out[id] = oursRouteHome
+		case oursTierBackup:
+			out[id] = oursRouteHealthy
+		case oursTierFallback:
+			out[id] = oursRouteFallback
+		default:
+			out[id] = oursRouteUnenrolled
+		}
+	}
+	return out
+}
+
+func (s *defaultOpenAIAccountScheduler) oursRouteTiers(state *oursSchedulerState, req OpenAIAccountScheduleRequest, roster []*Account, base map[int64]int) map[int64]int {
+	enabled := s.stats != nil && s.service != nil
+	var cfg openAIStickyEscapeConfig
+	if enabled {
+		cfg = s.service.openAIStickyEscapeConfig()
+		enabled = cfg.enabled
+	}
+	errorRateOf := func(accountID int64) float64 {
+		if s.stats == nil {
+			return 0
 		}
 		errorRate, _, _ := s.stats.snapshot(accountID)
-		demote := cfg.enabled && errorRate > cfg.errorRate
-		state.recordPrimaryHealth(accountID, demote, errorRate, cfg.errorRate)
-		if !demote {
+		return errorRate
+	}
+
+	tiers := oursRouteTiersFromBase(base)
+	var homes, healthyBackups, liveBackups []int64
+	// 按名单顺序遍历，保证确定性（map 遍历顺序随机）。
+	for _, account := range roster {
+		if account == nil {
 			continue
 		}
-		if _, excluded := req.ExcludedIDs[accountID]; excluded {
+		switch base[account.ID] {
+		case oursTierPrimary:
+			homes = append(homes, account.ID)
+		case oursTierBackup:
+			unhealthy := enabled && state.backupUnhealthy(account.ID, errorRateOf(account.ID), cfg.errorRate)
+			if unhealthy {
+				tiers[account.ID] = oursRouteUnhealthy
+			}
+			if _, excluded := req.ExcludedIDs[account.ID]; excluded {
+				continue
+			}
+			liveBackups = append(liveBackups, account.ID)
+			if !unhealthy {
+				healthyBackups = append(healthyBackups, account.ID)
+			}
+		}
+	}
+
+	// 会话固定备用：从「本次没被排除的健康备用」里按会话哈希选；一个健康的都没有时从全部备用里选，
+	// 全局风暴时也不追着「最不差」的号跑。同一会话每次得到同一个，不同会话均匀分散。
+	if sessionHash := strings.TrimSpace(req.SessionHash); sessionHash != "" {
+		pool := healthyBackups
+		if len(pool) == 0 {
+			pool = liveBackups
+		}
+		if designated, ok := oursRendezvous(sessionHash, pool); ok {
+			tiers[designated] = oursRouteDesignated
+		}
+	}
+
+	for _, homeID := range homes {
+		demoted := enabled && state.primaryDemoted(homeID, errorRateOf(homeID), cfg.errorRate)
+		if !demoted {
+			continue
+		}
+		if _, excluded := req.ExcludedIDs[homeID]; excluded {
 			// 本次请求已经排除了它（failover 重试）：档位无关紧要，也不消耗探测名额。
 			continue
 		}
-		if state.takeProbe(accountID) {
+		if len(healthyBackups) == 0 {
+			// 没有健康备用可让：留在本组，保住缓存，不把流量推给同样不健康的号。
 			continue
 		}
-		if adjusted == nil {
-			adjusted = make(map[int64]int, len(tiers))
-			for id, t := range tiers {
-				adjusted[id] = t
-			}
+		if state.takeProbe(homeID) {
+			continue
 		}
-		adjusted[accountID] = oursTierBackup
+		tiers[homeID] = oursRouteUnhealthy
 	}
-	if adjusted == nil {
-		return tiers
-	}
-	return adjusted
+	return tiers
 }
 
-func (state *oursSchedulerState) recordPrimaryHealth(accountID int64, demoted bool, errorRate, threshold float64) {
+// primaryDemoted 更新并返回本组的降级状态（带滞回），只在状态切换时打日志。
+func (state *oursSchedulerState) primaryDemoted(accountID int64, errorRate, threshold float64) bool {
 	flag, ok := oursMapLoad[atomic.Bool](&state.demoted, accountID)
+	prev := ok && flag.Load()
+	next := oursNextUnhealthy(prev, errorRate, threshold)
+	if next == prev {
+		return next
+	}
 	if !ok {
-		if !demoted {
-			return
-		}
 		flag = oursMapLoadOrStore(&state.demoted, accountID, func() *atomic.Bool { return new(atomic.Bool) })
 	}
-	if demoted {
-		if flag.CompareAndSwap(false, true) {
-			slog.Info("ours_primary_demoted", "account_id", accountID, "error_rate", errorRate, "threshold", threshold)
+	if flag.CompareAndSwap(prev, next) {
+		event := "ours_primary_restored"
+		if next {
+			event = "ours_primary_demoted"
 		}
-		return
+		slog.Info(event, "account_id", accountID, "error_rate", errorRate, "threshold", threshold)
 	}
-	if flag.CompareAndSwap(true, false) {
-		slog.Info("ours_primary_restored", "account_id", accountID, "error_rate", errorRate, "threshold", threshold)
+	return next
+}
+
+// backupUnhealthy 更新并返回备用账号的不健康状态（与本组同一套滞回规则，不打日志）。
+func (state *oursSchedulerState) backupUnhealthy(accountID int64, errorRate, threshold float64) bool {
+	flag, ok := oursMapLoad[atomic.Bool](&state.unhealthy, accountID)
+	prev := ok && flag.Load()
+	next := oursNextUnhealthy(prev, errorRate, threshold)
+	if next == prev {
+		return next
 	}
+	if !ok {
+		flag = oursMapLoadOrStore(&state.unhealthy, accountID, func() *atomic.Bool { return new(atomic.Bool) })
+	}
+	flag.CompareAndSwap(prev, next)
+	return next
+}
+
+// oursRendezvous 按「会话 × 账号」做最高随机权重哈希（rendezvous hashing）：
+// 同一会话在同一候选集合上永远选中同一个账号；某个账号退出集合时，只有原本选中它的会话会换号。
+func oursRendezvous(sessionHash string, candidates []int64) (int64, bool) {
+	var best int64
+	var bestScore uint64
+	found := false
+	for _, accountID := range candidates {
+		score := oursMix64(oursFNV64(sessionHash, accountID))
+		if !found || score > bestScore || (score == bestScore && accountID < best) {
+			best, bestScore, found = accountID, score, true
+		}
+	}
+	return best, found
+}
+
+func oursFNV64(sessionHash string, accountID int64) uint64 {
+	const (
+		offset = 14695981039346656037
+		prime  = 1099511628211
+	)
+	h := uint64(offset)
+	for i := 0; i < len(sessionHash); i++ {
+		h ^= uint64(sessionHash[i])
+		h *= prime
+	}
+	h ^= ':'
+	h *= prime
+	v := uint64(accountID)
+	for i := 0; i < 8; i++ {
+		h ^= v & 0xff
+		h *= prime
+		v >>= 8
+	}
+	return h
+}
+
+// oursMix64 是 splitmix64 的收尾混合，弥补 FNV 在短输入上的雪崩不足，让各账号被选中的概率均匀。
+func oursMix64(x uint64) uint64 {
+	x ^= x >> 30
+	x *= 0xbf58476d1ce4e5b9
+	x ^= x >> 27
+	x *= 0x94d049bb133111eb
+	x ^= x >> 31
+	return x
 }
 
 // takeProbe 返回本次是否为探测轮次：降级期间每第 N 次选号返回 true。确定、无随机数。
@@ -455,5 +602,5 @@ func oursWeightsWithScoreGroup(ctx context.Context, weights GatewayOpenAIWSSched
 // oursSnapshotTiers 是诊断快照用的档位表：与真实路由同一规则，但不做健康降级
 // （快照路径把 errorRate 固定为 0，降级靠 ours_primary_demoted 日志观察）。
 func oursSnapshotTiers(accounts []*Account, weights GatewayOpenAIWSSchedulerScoreWeightsView) map[int64]int {
-	return oursGroupTiers(accounts, weights.oursGroupID)
+	return oursRouteTiersFromBase(oursGroupTiers(accounts, weights.oursGroupID))
 }
