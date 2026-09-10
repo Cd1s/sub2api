@@ -560,7 +560,7 @@ func (h *AccountHandler) buildOpenAIAccountSchedulerScores(
 		if len(pool) == 0 {
 			return
 		}
-		scores := h.scoreOpenAIAccountSchedulerPool(ctx, pool, loadMap)
+		scores := h.scoreOpenAIAccountSchedulerPool(service.OursWithSchedulerScoreGroup(ctx, groupID), pool, loadMap)
 		for accountID, schedulerScore := range scores {
 			if _, ok := pageOpenAIAccountIDs[accountID]; !ok {
 				continue

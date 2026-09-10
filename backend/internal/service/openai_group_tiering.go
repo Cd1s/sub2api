@@ -1,19 +1,26 @@
 package service
 
 import (
+	"encoding/json"
+	"math"
 	"os"
+	"strconv"
 	"strings"
 )
 
 // 「登记制组内分档」补丁（fork 私有，不来自上游）。
 //
 // 目的：让 OpenAI 高级调度器在同一个分组内做到「本组优先 + 溢出均衡」：
-//   - 本组专属账号永远排第一顺位；
+//   - 本组账号永远排第一顺位；
 //   - 本组不可用时，溢出请求在其余备用账号之间按当前负载/健康分散，而不是打满一个再换下一个；
 //   - 只有显式登记过的账号才参与这套排法，未登记账号既不抢位置也不影响登记账号之间的相对顺序。
 //
+// 本组由账号级标记 credentials.ours_home_groups 显式声明，**完全不再用 priority 推断**。
+// 这样同一个账号可以同时是自己几个分组的本组、其它所有分组的备用，
+// 所有 Pro 账号可以绑进所有分组而不会让 priority 最小的那个吃掉全站流量。
+//
 // 实现方式：不新增数据库字段，只在高级调度器内把候选的「调度用 priority」从全局
-// accounts.priority 换成组内档位（见 openAITieredPriorities）。档位相同的账号打分相同，
+// accounts.priority 换成组内档位（见 oursGroupTiers）。档位相同的账号打分相同，
 // 上游现成的 tie-break 会落到 LoadRate 低者优先——这就是「按当前负载分散」。
 //
 // 池内没有任何登记账号时返回 nil，调用方回落上游原逻辑，行为与上游完全一致。
@@ -21,22 +28,26 @@ import (
 // 档位定义。数值越小越优先，且必须全部 > 0
 // （openAICandidateOrderingPriority 用 0 判断「候选未参与打分循环」）。
 const (
-	oursTierPrimary    = 1 // 本组专属：登记账号中全局 priority 最小者（可并列）
+	oursTierPrimary    = 1 // 本组：登记账号中声明了当前分组的
 	oursTierBackup     = 2 // 同档备用：其余登记账号，彼此平等
-	oursTierFallback   = 3 // 兜底：登记账号中全局 priority 最大者
+	oursTierFallback   = 3 // 兜底：非本组登记账号中 priority 严格最大且唯一者
 	oursTierUnenrolled = 4 // 未登记账号：排在所有登记账号之后
 )
 
-// oursGroupTieringCredentialKey 是账号级登记开关在 credentials 中的键名。
-const oursGroupTieringCredentialKey = "ours_tiering"
-
-// oursGroupTieringEnabled 是整体开关：环境变量 SUB2API_OURS_GROUP_TIERING 为
-// "0"/"false"/"off" 时关闭分档，默认开启。进程启动时读一次；关闭后调度行为与上游
-// 完全一致，用于紧急回滚（改 systemd unit 重启即可，不需要动数据）。
-var oursGroupTieringEnabled = oursGroupTieringEnabledFromEnv(os.Getenv(oursGroupTieringEnvKey))
+const (
+	// oursGroupTieringCredentialKey 是账号级登记开关在 credentials 中的键名。
+	oursGroupTieringCredentialKey = "ours_tiering"
+	// oursHomeGroupsCredentialKey 声明该账号担任本组的分组 ID 列表。
+	oursHomeGroupsCredentialKey = "ours_home_groups"
+)
 
 // oursGroupTieringEnvKey 是整体开关的环境变量名。
 const oursGroupTieringEnvKey = "SUB2API_OURS_GROUP_TIERING"
+
+// oursGroupTieringEnabled 是整体开关：环境变量为 "0"/"false"/"off" 时关闭分档、
+// 健康降级、探测和会话回家，默认开启。进程启动时读一次；关闭后调度行为与上游
+// 完全一致，用于紧急回滚（改 systemd unit 重启即可，不需要动数据）。
+var oursGroupTieringEnabled = oursGroupTieringEnabledFromEnv(os.Getenv(oursGroupTieringEnvKey))
 
 func oursGroupTieringEnabledFromEnv(raw string) bool {
 	v := strings.ToLower(strings.TrimSpace(raw))
@@ -60,50 +71,193 @@ func oursTieringEnrolled(a *Account) bool {
 	return false
 }
 
-// openAITieredPriorities 只在池内存在登记账号时返回档位表：
-// 登记账号中全局 priority 最小者 = 1（可并列）、最大者 = 3、其余 = 2；未登记账号 = 4。
-// 登记账号 priority 全相等（min == max）时全部为 1；只有两个不同值时只会出现 1 和 3。
-// 池内无登记账号、或整体开关关闭时返回 nil，调用方回落上游原逻辑。
+// oursParseHomeGroups 解析 credentials.ours_home_groups。
 //
-// 注意：min/max 只在登记账号之间统计，未登记账号的 priority 不参与，
-// 因此新加进分组但未登记的账号不会改变登记账号之间的档位。
-func openAITieredPriorities(accounts []*Account) map[int64]int {
+// 接受三种写法：
+//   - 逗号分隔的字符串 "8,9,17"（元素两侧空白忽略）；
+//   - JSON 数组字符串 "[8,9,17]" 或 "[\"8\",\"9\"]"；
+//   - 已解码的数组（元素为数字或数字字符串，含 json.Number）。
+//
+// 空串、空数组、任一元素非法（非整数、≤0、无法解析）时返回 nil，
+// 即「整条标记作废」，等同于没有标记——宁可不当本组，也不按半条错误配置去调度。
+func oursParseHomeGroups(value any) []int64 {
+	switch v := value.(type) {
+	case nil:
+		return nil
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return nil
+		}
+		if strings.HasPrefix(s, "[") {
+			var items []any
+			decoder := json.NewDecoder(strings.NewReader(s))
+			decoder.UseNumber()
+			if err := decoder.Decode(&items); err != nil {
+				return nil
+			}
+			return oursParseHomeGroupItems(items)
+		}
+		parts := strings.Split(s, ",")
+		items := make([]any, 0, len(parts))
+		for _, part := range parts {
+			items = append(items, part)
+		}
+		return oursParseHomeGroupItems(items)
+	case []any:
+		return oursParseHomeGroupItems(v)
+	case []string:
+		items := make([]any, 0, len(v))
+		for _, item := range v {
+			items = append(items, item)
+		}
+		return oursParseHomeGroupItems(items)
+	case []int64:
+		items := make([]any, 0, len(v))
+		for _, item := range v {
+			items = append(items, item)
+		}
+		return oursParseHomeGroupItems(items)
+	case []int:
+		items := make([]any, 0, len(v))
+		for _, item := range v {
+			items = append(items, item)
+		}
+		return oursParseHomeGroupItems(items)
+	}
+	return nil
+}
+
+func oursParseHomeGroupItems(items []any) []int64 {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]int64, 0, len(items))
+	seen := make(map[int64]struct{}, len(items))
+	for _, item := range items {
+		id, ok := oursParseHomeGroupID(item)
+		if !ok {
+			return nil
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+func oursParseHomeGroupID(item any) (int64, bool) {
+	var id int64
+	switch v := item.(type) {
+	case string:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		id = parsed
+	case json.Number:
+		parsed, err := v.Int64()
+		if err != nil {
+			return 0, false
+		}
+		id = parsed
+	case float64:
+		if v != math.Trunc(v) || v > math.MaxInt64 || v < math.MinInt64 {
+			return 0, false
+		}
+		id = int64(v)
+	case int:
+		id = int64(v)
+	case int64:
+		id = v
+	default:
+		return 0, false
+	}
+	if id <= 0 {
+		return 0, false
+	}
+	return id, true
+}
+
+// oursDeclaresHomeGroup 判断账号是否声明自己是 groupID 的本组。
+func oursDeclaresHomeGroup(a *Account, groupID int64) bool {
+	if a == nil || a.Credentials == nil || groupID <= 0 {
+		return false
+	}
+	raw, ok := a.Credentials[oursHomeGroupsCredentialKey]
+	if !ok {
+		return false
+	}
+	for _, id := range oursParseHomeGroups(raw) {
+		if id == groupID {
+			return true
+		}
+	}
+	return false
+}
+
+// oursGroupTiers 计算某个分组内的档位表：
+//
+//	档 1：登记账号中，ours_home_groups 包含当前分组的；
+//	档 3：除档 1 外的登记账号中，priority 严格最大且唯一的（兜底）；最大值有并列时不设档 3；
+//	档 2：其余登记账号；
+//	档 4：未登记账号。
+//
+// groupID 为 nil（没有分组上下文）时按「无本组」处理，不设档 1。
+// 名单里没有账号声明当前分组（本组暂时掉出名单：429、过载、临时不可调度）时，
+// 该组本次同样不设档 1——整组流量在备用之间平摊，**不会有别的号顶替成本组**。
+// 池内没有任何登记账号、或整体开关关闭时返回 nil，调用方回落上游原逻辑。
+func oursGroupTiers(accounts []*Account, groupID *int64) map[int64]int {
 	if !oursGroupTieringEnabled {
 		return nil
 	}
-	minPriority, maxPriority := 0, 0
-	enrolled := 0
-	for _, account := range accounts {
+	gid := int64(0)
+	if groupID != nil {
+		gid = *groupID
+	}
+
+	type accountTierInput struct {
+		enrolled bool
+		home     bool
+	}
+	inputs := make([]accountTierInput, len(accounts))
+	anyEnrolled := false
+	fallbackPriority, fallbackCount, hasFallback := 0, 0, false
+	for i, account := range accounts {
 		if !oursTieringEnrolled(account) {
 			continue
 		}
-		if enrolled == 0 {
-			minPriority, maxPriority = account.Priority, account.Priority
-		} else {
-			if account.Priority < minPriority {
-				minPriority = account.Priority
-			}
-			if account.Priority > maxPriority {
-				maxPriority = account.Priority
-			}
+		anyEnrolled = true
+		home := gid > 0 && oursDeclaresHomeGroup(account, gid)
+		inputs[i] = accountTierInput{enrolled: true, home: home}
+		if home {
+			continue
 		}
-		enrolled++
+		switch {
+		case !hasFallback || account.Priority > fallbackPriority:
+			fallbackPriority, fallbackCount, hasFallback = account.Priority, 1, true
+		case account.Priority == fallbackPriority:
+			fallbackCount++
+		}
 	}
-	if enrolled == 0 {
+	if !anyEnrolled {
 		return nil
 	}
 
 	tiers := make(map[int64]int, len(accounts))
-	for _, account := range accounts {
+	for i, account := range accounts {
 		if account == nil {
 			continue
 		}
+		input := inputs[i]
 		switch {
-		case !oursTieringEnrolled(account):
+		case !input.enrolled:
 			tiers[account.ID] = oursTierUnenrolled
-		case minPriority == maxPriority, account.Priority == minPriority:
+		case input.home:
 			tiers[account.ID] = oursTierPrimary
-		case account.Priority == maxPriority:
+		case hasFallback && fallbackCount == 1 && account.Priority == fallbackPriority:
 			tiers[account.ID] = oursTierFallback
 		default:
 			tiers[account.ID] = oursTierBackup
@@ -112,9 +266,12 @@ func openAITieredPriorities(accounts []*Account) map[int64]int {
 	return tiers
 }
 
-// openAICandidateTieredPriorities 从候选切片构造档位表，供真实路由挂钩点使用。
-// 档位在「实际参与打分的候选池」内计算，与其后的 min-max 归一化保持同一集合。
-func openAICandidateTieredPriorities(candidates []openAIAccountCandidateScore) map[int64]int {
+// openAIPlanTiers 优先用请求里预先算好的名单档位表（含健康降级）；没有时
+// （其它调用路径、单测直接构造 plan）回落到候选池按同一规则自算。
+func openAIPlanTiers(req OpenAIAccountScheduleRequest, candidates []openAIAccountCandidateScore) map[int64]int {
+	if req.oursTiers != nil {
+		return req.oursTiers
+	}
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -122,47 +279,7 @@ func openAICandidateTieredPriorities(candidates []openAIAccountCandidateScore) m
 	for i := range candidates {
 		accounts = append(accounts, candidates[i].account)
 	}
-	return openAITieredPriorities(accounts)
-}
-
-// openAIAccountRosterTiers 在**分组完整名单**上计算档位表。
-//
-// 这一步必须发生在 failover 排除（req.ExcludedIDs）和运行时封禁
-// （isOpenAIAccountRequestRuntimeBlocked：429 冷却、临时不可调度等）之前，
-// 否则本组账号一旦出池，剩下的备用里 priority 最小的那个就会顶替成新的档 1，
-// 溢出又会全压在它一个身上——正是本补丁要消灭的固定瀑布。
-//
-// 名单来自 listSchedulableAccounts()，它不随单次请求的失败重试变化。
-func openAIAccountRosterTiers(roster []Account) map[int64]int {
-	if !oursGroupTieringEnabled || len(roster) == 0 {
-		return nil
-	}
-	// 先无分配地扫一遍：这个分组一个登记账号都没有就直接回落上游，
-	// 不为它在每次请求上分配指针切片。
-	enrolled := false
-	for i := range roster {
-		if oursTieringEnrolled(&roster[i]) {
-			enrolled = true
-			break
-		}
-	}
-	if !enrolled {
-		return nil
-	}
-	accounts := make([]*Account, 0, len(roster))
-	for i := range roster {
-		accounts = append(accounts, &roster[i])
-	}
-	return openAITieredPriorities(accounts)
-}
-
-// openAIPlanTiers 优先用请求里预先算好的名单档位表；没有时（其它调用路径、
-// 单测直接构造 plan）回落到候选池自算，行为仍然正确，只是本组出池后档位会重排。
-func openAIPlanTiers(req OpenAIAccountScheduleRequest, candidates []openAIAccountCandidateScore) map[int64]int {
-	if req.oursTiers != nil {
-		return req.oursTiers
-	}
-	return openAICandidateTieredPriorities(candidates)
+	return oursGroupTiers(accounts, req.GroupID)
 }
 
 // openAISchedulingPriorityFor 是 openAIAccountSchedulingPriority 的分档版本：

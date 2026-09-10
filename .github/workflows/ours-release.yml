@@ -1,11 +1,12 @@
 name: Ours Release
 
-# fork 私有工作流：只在 vX.Y.Z-ours tag 上跑，产出 linux/arm64 二进制附件。
+# fork 私有工作流：只在 vX.Y.Z-ours* tag 上跑，产出 linux/arm64 + linux/amd64 发布包。
 # 不建 GitHub Release、不推任何镜像、不碰上游。
 on:
   push:
     tags:
       - 'v*-ours'
+      - 'v*-ours.*'
   workflow_dispatch:
 
 permissions:
@@ -45,37 +46,20 @@ jobs:
         working-directory: backend
         run: |
           go test ./internal/service/ -count=1 -v \
-            -run 'Tiering|TieredPriorities|CandidateBetter|LoadPlan|ScoreSnapshot|SchedulingPriorityFor'
+            -run 'Ours|Tiering|CandidateBetter|LoadPlan|ScoreSnapshot|SchedulingPriorityFor|RateLimitServiceSchedulerScore'
 
-      - name: Build frontend (vite outDir = backend/internal/web/dist)
+      - name: Frontend toggle spec
         run: |
           pnpm --dir frontend install --frozen-lockfile
-          pnpm --dir frontend run build
-          test -f backend/internal/web/dist/index.html
+          (cd frontend && npx vitest run src/components/account/__tests__/EditAccountModal.oursTiering.spec.ts)
 
-      - name: Build linux/arm64 binary
-        working-directory: backend
-        env:
-          CGO_ENABLED: '0'
-          GOOS: linux
-          GOARCH: arm64
-        run: |
-          VERSION="$(./scripts/resolve-version.sh)"
-          COMMIT="$(git rev-parse --short HEAD)"
-          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          go build -tags=embed -trimpath \
-            -ldflags "-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.Date=${DATE} -X main.BuildType=release" \
-            -o ../dist/sub2api_linux_arm64 ./cmd/server
-
-      - name: Checksum
-        run: |
-          cd dist
-          sha256sum sub2api_linux_arm64 | tee sub2api_linux_arm64.sha256
+      - name: Build release archives (linux/arm64 + linux/amd64)
+        run: ours/build-release.sh dist
 
       - uses: actions/upload-artifact@v7
         with:
-          name: sub2api_linux_arm64
+          name: sub2api-ours-linux
           path: |
-            dist/sub2api_linux_arm64
-            dist/sub2api_linux_arm64.sha256
+            dist/sub2api_*_linux_*.tar.gz
+            dist/checksums.txt
           retention-days: 30

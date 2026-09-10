@@ -1051,6 +1051,10 @@ export default {
       loadFactorHint: '提高负载因子可以提高对账号的调度频率',
       priority: '优先级',
       priorityHint: '优先级越小的账号优先使用',
+      oursTiering: {
+        title: '加入号池动态调度',
+        desc: '勾选后本账号参与动态调度：在它的本组里排第一，在其它分组里与其它参与账号同档、互为备用、按负载均摊。未勾选的账号不参与，排在所有参与账号之后。兜底账号请把优先级调到最大。与「号池模式」是两个独立的设置。'
+      },
       billingRateMultiplier: '账号计费倍率',
       billingRateMultiplierHint: '0 表示不计费，仅影响账号计费',
       expiresAt: '过期时间',

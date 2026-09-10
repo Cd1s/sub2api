@@ -89,8 +89,9 @@ type OpenAIAccountScheduleRequest struct {
 	// and compact_model_mapping; native remote compaction v2 leaves it false.
 	RequireCompact bool
 	ExcludedIDs    map[int64]struct{}
-	// oursTiers 见 openai_group_tiering.go：分组完整名单上算出的组内档位表。
-	oursTiers map[int64]int
+	// oursTiers / oursQuietEscape 见 ours_health_home.go：组内档位表、回家尝试时静默逃逸日志。
+	oursTiers       map[int64]int
+	oursQuietEscape bool
 }
 
 type OpenAIAccountScheduleDecision struct {
@@ -448,6 +449,9 @@ func (s *defaultOpenAIAccountScheduler) Select(
 	}
 
 	if !req.StickyWeighted {
+		if selection, ok := s.oursTryReturnHome(ctx, req, &decision); ok {
+			return selection, decision, nil
+		}
 		selection, escapedSticky, err := s.selectBySessionHash(ctx, req)
 		if err != nil {
 			return nil, decision, err
@@ -558,7 +562,7 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 	}
 	escapeCfg := s.service.openAIStickyEscapeConfig()
 	if reason, errorRate, ttft, shouldEscape := s.shouldEscapeStickyAccount(accountID, escapeCfg); shouldEscape {
-		slog.Info("sticky_escape_triggered",
+		oursStickyEscapeInfo(req)("sticky_escape_triggered",
 			"account_id", accountID,
 			"reason", reason,
 			"error_rate", errorRate,
@@ -583,7 +587,7 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 	if s.service.concurrencyService != nil {
 		if escapeCfg.enabled && acquireErr == nil && result != nil && !result.Acquired {
 			errorRate, ttft, _ := s.stats.snapshot(accountID)
-			slog.Info("sticky_escape_triggered",
+			oursStickyEscapeInfo(req)("sticky_escape_triggered",
 				"account_id", accountID,
 				"reason", "concurrency_full",
 				"error_rate", errorRate,
@@ -1431,7 +1435,7 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 		schedGroup, _ = s.service.schedulerSnapshot.GetGroupByID(ctx, *req.GroupID)
 	}
 
-	req.oursTiers = openAIAccountRosterTiers(accounts)
+	req.oursTiers = s.oursRosterTiers(req, accounts)
 
 	filterStats := openAISelectionFilterStats{pool: len(accounts)}
 	filtered := make([]*Account, 0, len(accounts))
@@ -2616,6 +2620,7 @@ type GatewayOpenAIWSSchedulerScoreWeightsView struct {
 	UpstreamCost  float64
 	Previous      float64
 	SessionSticky float64
+	oursGroupID   *int64 // 见 ours_health_home.go：管理端按组打分时的分组
 }
 
 func (w GatewayOpenAIWSSchedulerScoreWeightsView) configWeights() config.GatewayOpenAIWSSchedulerScoreWeights {
@@ -2652,7 +2657,7 @@ func (s *RateLimitService) BuildOpenAIAccountSchedulerScoreSnapshot(
 	return buildOpenAIAccountSchedulerScoreSnapshot(
 		accounts,
 		loadMap,
-		gateway.openAIWSSchedulerWeightsForRequest(ctx),
+		oursWeightsWithScoreGroup(ctx, gateway.openAIWSSchedulerWeightsForRequest(ctx)),
 		gateway.isOpenAIAdvancedSchedulerStickyWeightedEnabled(ctx),
 		gateway.openAIOAuthSchedulingRateMultiplier(ctx),
 	)
@@ -2697,7 +2702,7 @@ func buildOpenAIAccountSchedulerScoreSnapshot(
 		return nil
 	}
 
-	tiers := openAITieredPriorities(accounts)
+	tiers := oursSnapshotTiers(accounts, weights)
 	minPriority, maxPriority := openAISchedulingPriorityFor(candidates[0].account, tiers), openAISchedulingPriorityFor(candidates[0].account, tiers)
 	maxWaiting := 1
 	for i := range candidates {

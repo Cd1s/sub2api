@@ -1665,6 +1665,26 @@
           </div>
         </div>
       </div>
+      <!-- fork 私有：加入号池动态调度（credentials.ours_tiering） -->
+      <div
+        v-if="oursTieringSupported"
+        class="border-t border-gray-200 pt-4 dark:border-dark-600"
+        data-testid="ours-tiering-section"
+      >
+        <div class="flex items-center justify-between gap-3">
+          <div class="min-w-0">
+            <label class="input-label mb-0">{{ t('admin.accounts.oursTiering.title') }}</label>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.accounts.oursTiering.desc') }}
+            </p>
+          </div>
+          <Toggle
+            v-model="oursTieringEnabled"
+            data-testid="ours-tiering-toggle"
+            :aria-label="t('admin.accounts.oursTiering.title')"
+          />
+        </div>
+      </div>
       <div class="border-t border-gray-200 pt-4 dark:border-dark-600">
         <label class="input-label">{{ t('admin.accounts.expiresAt') }}</label>
         <input v-model="expiresAtInput" type="datetime-local" class="input" />
@@ -3252,6 +3272,13 @@ const MAX_POOL_MODE_RETRY_COUNT = 10
 const DEFAULT_POOL_MODE_RETRY_STATUS_CODES = [401, 403, 429]
 const GROK_CLIENT_TOOL_CACHE_EXTRA_KEY = 'grok_client_tool_cache_enabled'
 const poolModeEnabled = ref(false)
+// fork 私有：加入号池动态调度（credentials.ours_tiering）
+const oursTieringEnabled = ref(false)
+const oursTieringSupported = computed(
+  () => (props.account?.platform === 'openai' || props.account?.platform === 'grok') && !isSparkShadow.value
+)
+const isOursTieringOn = (value: unknown): boolean =>
+  value === true || (typeof value === 'string' && ['true', '1'].includes(value.trim().toLowerCase()))
 const poolModeRetryCount = ref(DEFAULT_POOL_MODE_RETRY_COUNT)
 const poolModeRetryStatusCodesInput = ref('')
 
@@ -3857,6 +3884,9 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   form.concurrency = newAccount.concurrency
   form.load_factor = newAccount.load_factor ?? null
   form.priority = newAccount.priority
+  oursTieringEnabled.value = isOursTieringOn(
+    (newAccount.credentials as Record<string, unknown> | undefined)?.ours_tiering
+  )
   form.rate_multiplier = newAccount.rate_multiplier ?? 1
   form.status = (newAccount.status === 'active' || newAccount.status === 'inactive' || newAccount.status === 'error')
     ? newAccount.status
@@ -5216,6 +5246,25 @@ const handleSubmit = async () => {
       const currentCredentials = (updatePayload.credentials as Record<string, unknown>) ||
         ((props.account.credentials as Record<string, unknown>) || {})
       updatePayload.credentials = applyPlanType({ ...currentCredentials }, editPlanType.value)
+    }
+
+    // fork 私有：加入号池动态调度 = credentials.ours_tiering（登记制组内分档）。
+    // 只在开关状态与打开时不同、或本次本来就要提交凭据时写入，避免无关编辑触碰 credentials。
+    if (oursTieringSupported.value) {
+      const initialOursTiering = isOursTieringOn(
+        (props.account.credentials as Record<string, unknown> | undefined)?.ours_tiering
+      )
+      if (updatePayload.credentials || oursTieringEnabled.value !== initialOursTiering) {
+        const currentCredentials = (updatePayload.credentials as Record<string, unknown>) ||
+          ((props.account.credentials as Record<string, unknown>) || {})
+        const newCredentials: Record<string, unknown> = { ...currentCredentials }
+        if (oursTieringEnabled.value) {
+          newCredentials.ours_tiering = true
+        } else {
+          delete newCredentials.ours_tiering
+        }
+        updatePayload.credentials = newCredentials
+      }
     }
 
     // Antigravity: persist model mapping to credentials (applies to all antigravity types)

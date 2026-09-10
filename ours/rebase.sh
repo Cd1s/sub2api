@@ -33,6 +33,39 @@ fi
 
 die() { echo; echo "❌ $*" >&2; exit 1; }
 
+# 挂钩锚点检查：rebase 后逐个 grep 本补丁在上游文件里的挂钩行，缺任何一个就停下，
+# 交人工判断上游是否重构了挂钩处（见 PATCH-NOTES「冲突处理原则」）。
+# 格式：文件|期望次数|扩展正则
+HOOKS=(
+  "backend/internal/service/openai_account_scheduler.go|1|oursTiers[[:space:]]+map\[int64\]int"
+  "backend/internal/service/openai_account_scheduler.go|1|oursQuietEscape[[:space:]]+bool"
+  "backend/internal/service/openai_account_scheduler.go|1|s\.oursTryReturnHome\(ctx, req, &decision\)"
+  "backend/internal/service/openai_account_scheduler.go|2|oursStickyEscapeInfo\(req\)\(\"sticky_escape_triggered\","
+  "backend/internal/service/openai_account_scheduler.go|1|openAICandidateOrderingPriority\(left\), openAICandidateOrderingPriority\(right\)"
+  "backend/internal/service/openai_account_scheduler.go|1|tiers := openAIPlanTiers\(req, candidates\)"
+  "backend/internal/service/openai_account_scheduler.go|2|openAISchedulingPriorityFor\(candidate\.account, tiers\)"
+  "backend/internal/service/openai_account_scheduler.go|1|req\.oursTiers = s\.oursRosterTiers\(req, accounts\)"
+  "backend/internal/service/openai_account_scheduler.go|1|oursGroupID[[:space:]]+\*int64"
+  "backend/internal/service/openai_account_scheduler.go|1|oursWeightsWithScoreGroup\(ctx, gateway\.openAIWSSchedulerWeightsForRequest\(ctx\)\)"
+  "backend/internal/service/openai_account_scheduler.go|1|tiers := oursSnapshotTiers\(accounts, weights\)"
+  "backend/internal/handler/admin/account_handler.go|1|service\.OursWithSchedulerScoreGroup\(ctx, groupID\)"
+  "frontend/src/components/account/EditAccountModal.vue|1|data-testid=\"ours-tiering-toggle\""
+)
+
+check_hooks() {
+  local failed=0 entry file want pattern got
+  for entry in "${HOOKS[@]}"; do
+    IFS='|' read -r file want pattern <<<"$entry"
+    got="$(grep -cE -- "$pattern" "$file" 2>/dev/null || true)"
+    if [ "$got" != "$want" ]; then
+      echo "    ✗ $file 期望 $want 处，实际 ${got:-0} 处：$pattern" >&2
+      failed=1
+    fi
+  done
+  [ "$failed" = "0" ] || die "挂钩锚点缺失或重复。上游可能重构了挂钩处，按 PATCH-NOTES「冲突处理原则」人工处理后再重跑。"
+  echo "    ${#HOOKS[@]} 个挂钩锚点全部就位。"
+}
+
 # ---------------------------------------------------------------- 前置检查
 ORIGIN_URL="$(git remote get-url origin)"
 UPSTREAM_URL="$(git remote get-url upstream 2>/dev/null || true)"
@@ -92,8 +125,8 @@ rebase 有冲突。处理原则（详见 PATCH-NOTES.md「冲突处理原则」�
   可以自行解决：纯位置漂移、空白、import 顺序、上下文行变化。
   必须停下来人工确认：
     - 挂钩函数被删/改签名/改语义
-      (buildOpenAIAccountLoadPlan / buildOpenAIAccountSchedulerScoreSnapshot /
-       isOpenAIAccountCandidateBetter)
+      (Select / selectBySessionHash / selectByLoadBalance / buildOpenAIAccountLoadPlan /
+       buildOpenAIAccountSchedulerScoreSnapshot / isOpenAIAccountCandidateBetter)
     - openAIAccountCandidateScore 字段改名（尤其 priority）
     - Account.Credentials 类型或访问方式变化
     - 打分公式段 / TopK / 加权随机逻辑变化
@@ -109,12 +142,17 @@ EOF
 fi
 
 # ------------------------------------------------------------ 4) 测试与编译
+echo "==> [4/6] 挂钩锚点检查"
+check_hooks
+
 echo "==> [4/6] go build + 全量后端测试"
 (cd backend && go build ./...)
 (cd backend && go test ./...)
 echo "    补丁自带单测："
-(cd backend && go test ./internal/service/ -count=1 -run 'Tiering|TieredPriorities|CandidateBetter|LoadPlan|ScoreSnapshot|SchedulingPriorityFor' -v \
+(cd backend && go test ./internal/service/ -count=1 -run 'Ours|Tiering|CandidateBetter|LoadPlan|ScoreSnapshot|SchedulingPriorityFor|RateLimitServiceSchedulerScore' -v \
   | grep -E '^--- (PASS|FAIL)' || true)
+echo "    前端开关单测："
+(cd frontend && npx vitest run src/components/account/__tests__/EditAccountModal.oursTiering.spec.ts)
 
 if command -v golangci-lint >/dev/null 2>&1; then
   echo "    golangci-lint："
@@ -124,8 +162,8 @@ else
 fi
 
 # ---------------------------------------------------------------- 5) 出二进制
-echo "==> [5/6] 构建 linux/arm64 二进制"
-ours/build-linux-arm64.sh
+echo "==> [5/6] 构建 linux/arm64 + linux/amd64 发布包"
+ours/build-release.sh
 
 # -------------------------------------------------------------------- 6) 推送
 OURS_TAG="${NEW_TAG}-ours"

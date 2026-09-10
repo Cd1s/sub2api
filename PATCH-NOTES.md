@@ -1,335 +1,304 @@
-# PATCH-NOTES —— fork 私有调度补丁「登记制组内分档」
+# PATCH-NOTES —— fork 私有调度补丁
 
-> 本文件只存在于 fork `Cd1s/sub2api`，**不会也不应该出现在上游 `Wei-Shaw/sub2api`**。
+> 本文件只存在于本 fork，**不会也不应该出现在上游 `Wei-Shaw/sub2api`**。
 >
 > **推送规则（硬性）**：只允许 `git push origin ...`。
 > **禁止** `git push upstream`、`gh pr create`、`gh issue create`。
 
-基线：上游 `v0.2.4`（commit `5de5e2be`）。分支：`ours/scheduler-patch`。
-
----
-
-## 一、这个补丁解决什么
-
-8 个专属 ChatGPT 账号各服务固定的几个客户分组（24 组），外加 1 个公用兜底账号 monocle。需要：
-
-1. **本组优先**：客户请求永远先用本组专属账号。
-2. **溢出均衡**：专属账号不行时，溢出请求在其余备用账号之间按当前负载/健康分散，而不是「把 backup1 打满再去 backup2」。
-3. **显式登记才参与**：只作用于明确登记过的账号；未登记账号不抢位置、不改变别人排序；一个组里没有任何登记账号时行为与上游完全一致。
-
-上游只按全局 `accounts.priority`（小者优先）在候选池内做 min-max 归一化，单一梯子无法同时表达「本组第一」和「备用之间平等」：`lb_top_k=2` 时溢出 ~99% 落在 pf 最高的那个备用上；放大 K 又会把专属账号的第一顺位概率打到 ≤66%。
-
-**做法**：不新增数据库字段、不加迁移、不改写入 API、不改前端。只在高级调度器内，把候选的「调度用 priority」从全局数值换成**组内档位**，且只对登记账号生效。
-
-| 档位 | 定义 | 含义 |
+| 版本 | 基线 | 内容 |
 |---|---|---|
-| 1 | 登记账号中池内全局 `priority` **最小**者（可并列） | 本组专属 |
-| 2 | 其余登记账号 | 同档备用（彼此平等） |
-| 3 | 登记账号中池内全局 `priority` **最大**者（当 max ≠ min） | 兜底 monocle |
-| 4 | **未登记**账号（仅当池内有登记账号时） | 排最后 |
+| `v0.2.4-ours` | 上游 `v0.2.4`（`5de5e2be`） | 登记制组内分档（本组按 priority 推断） |
+| `v0.2.4-ours.2` | 同上 | 本组改为显式标记；本组健康门控降级 + 防饿死探测；会话自动回家（取代外部定时器）；管理端快照按组；后台「加入号池动态调度」开关 |
 
-登记标记：`account.credentials.ours_tiering == true`（也接受字符串 `"true"` / `"1"`）。
-池内没有任何登记账号 → 不分档，全部用原 `accounts.priority`，与上游逐字节一致。
-
-同档备用打分打平后，上游现成的 tie-break 落到 **LoadRate 低者优先**——这就是「按当前负载分散」。
+分支：`ours/scheduler-patch`（**fork 的默认分支**）。`main` 只镜像上游，永远不放补丁。
+不要点 GitHub 上的「Sync fork」按钮——它会把上游 merge 进补丁分支；同步上游一律用 `ours/rebase.sh`。
 
 ---
 
-## 二、补丁范围（挂钩点清单）
+## 一、要解决的问题
 
-新增 1 个文件 + 在上游文件里动 10 行（其中 4 行是纯新增），无签名变更、无重命名、无重排。
+一批专属账号各自服务固定的几个客户分组，另有一个公用兜底账号。目标：
 
-### 新增文件
+1. **本组优先**：客户请求先用本组账号。
+2. **溢出均衡**：本组不行时，溢出请求在所有其它备用账号之间按当前负载/健康分散，而不是「打满 backup1 再去 backup2」。
+3. **显式登记才参与**：只作用于明确登记过的账号；未登记账号不抢位置、不改变别人排序；没有登记账号的分组行为与上游完全一致。
+4. **所有专属账号给所有分组当备用**：每个分组的候选 = 全部专属账号 + 兜底，靠「本组标记」区分谁在这个组排第一。
 
-- `backend/internal/service/openai_group_tiering.go` —— 全部新增逻辑都在这里：
-  - `oursGroupTieringEnabled` / `oursGroupTieringEnabledFromEnv()` —— 整体环境变量开关
-  - `oursTieringEnrolled(*Account) bool` —— 账号级登记判定
-  - `openAITieredPriorities([]*Account) map[int64]int` —— 档位表（无登记账号返回 nil）
-  - `openAIAccountRosterTiers([]Account)` —— 在**分组完整名单**上算档位表（见挂钩点 A）
-  - `openAICandidateTieredPriorities([]openAIAccountCandidateScore)` —— 从候选切片构造档位表（回落用）
-  - `openAIPlanTiers(req, candidates)` —— 优先用名单档位表，没有才自算
-  - `openAISchedulingPriorityFor(*Account, tiers)` —— 有档位用档位，否则回落 `openAIAccountSchedulingPriority`
-  - `openAICandidateOrderingPriority(candidate)` —— tie-break 用的 priority（见挂钩点 D）
-- `backend/internal/service/openai_group_tiering_test.go` —— 保护三个挂钩点的单测
+上游只按全局 `accounts.priority` 在候选池内做 min-max 归一化，单一梯子无法同时表达「本组第一」和「备用之间平等」，更无法让同一个账号在自己的组排第一、在别人的组当平等备用。
 
-### 改动的上游代码（行号为打完补丁后的当前值，rebase 后以**函数名**为准）
+---
 
-全部在 `backend/internal/service/openai_account_scheduler.go`：
+## 二、档位规则
+
+不新增数据库字段、不加迁移、不改写入 API。只在高级调度器内，把候选的「调度用 priority」换成**组内档位**，且只对登记账号生效。
+
+两个账号级 credentials 键：
+
+| 键 | 含义 | 写法 |
+|---|---|---|
+| `ours_tiering` | 是否登记参与动态调度 | 布尔 `true`，或字符串 `"true"` / `"1"` |
+| `ours_home_groups` | 这个账号担任本组的分组 ID | 逗号分隔字符串 `"11,12,13"`；也接受 JSON 数组（元素为数字或数字字符串）。空串、空数组、任一元素非法 → 整条作废，等于没有标记 |
+
+档位**按当前分组**计算（选号请求带着分组）：
+
+| 档位 | 定义 |
+|---|---|
+| 1 | 登记账号中，`ours_home_groups` 包含当前分组的 |
+| 3 | 除档 1 外的登记账号中，priority **严格最大且唯一**的（兜底）；最大值有并列时不设档 3 |
+| 2 | 其余登记账号（同档备用，彼此平等） |
+| 4 | 未登记账号（仅当池内有登记账号时） |
+
+- **完全不用 priority 推断本组。** priority 只用来选兜底。
+- 名单里没有账号声明当前分组（包括本组暂时掉出名单：429、过载、临时不可调度）时，该组本次**不设档 1**，整组流量在备用之间平摊，**不会有别的号顶替成本组**。
+- 两个及以上登记账号声明同一组：都是档 1，该组不做会话回家。
+- 没有分组上下文时按「无本组」算。
+- 池内没有任何登记账号 → 档位表为 nil，全部回落原 `accounts.priority`，与上游逐字节一致。
+
+同档账号打分相同，上游现成的 tie-break 落到 LoadRate 低者优先——这就是「按当前负载分散」。
+
+**把所有专属账号的 priority 统一成同一个值**（兜底保持最大）不影响分档结果，但能让「关掉分档」时整组退化为「所有专属账号平摊、兜底最后」，而不是全压到 priority 最小的那个账号上。
+
+---
+
+## 三、本组健康门控降级 + 防饿死探测
+
+**问题**：本组领先备用 5000 分（`W_priority=10000` × pf 差 0.5），而错误率项最多只有 `W_error_rate=500` 分。本组 100% 失败时仍然约 99.98% 先打它，每个请求都要先失败一次才换号；绑在本组的会话因错误率逃逸后，负载均衡又会选回本组。
+
+**做法**：在选号的档位表里，档 1 账号的运行时错误率 **大于** sticky_escape 的错误率阈值（默认 0.5）时，本次选号把它**降为档 2**。
+
+- 阈值复用 sticky_escape 的错误率阈值，不新增配置；sticky_escape 整体关闭时不降级。
+- **只看错误率，不看首字延迟**：首字慢主要由请求本身决定（推理强度、上下文长度），换号不会变快，还会丢上游缓存。
+- 降级后本组和备用同为档 2，由现有 `W_error_rate` 挑更健康的（本组 60% 错误率、备用 0% 时差 300 分），健康度相同再比负载；兜底仍在档 3。
+- 返回新 map，不改原始档位表。
+
+**防饿死探测**：错误率 EWMA 只在有请求结果时更新，降级后没有流量，错误率会冻结在高位。所以被降级的本组**每第 N 次选号仍按档 1 参与一次**（默认 N=20，约 5%）。
+
+- 按账号 ID 的原子计数器，确定、可测试，不用随机数。
+- 本次请求已经排除了本组（failover 重试）时不计数，避免重试吃掉探测名额。
+- 探测请求失败会走现有 failover——这是「坏账号修好后能被发现」的必要代价。
+
+---
+
+## 四、会话自动回家（取代外部粘性过期定时器）
+
+**问题**：溢出或 failover 后绑到备用的会话，粘性层每次命中都会把 TTL 刷新成 1 小时，活跃会话会一直钉在备用上。以前靠一个外部定时器扫 Redis、删掉指向非本组账号超过 600 秒的粘性键；它直接删 Redis、自己维护状态文件、用 SQL 猜本组。现在写进源码，定时器退役。
+
+**挂钩**：`Select()` 的会话粘性层之前。
+
+**本组表（黏住版）**：每次负载均衡选号时，从分组完整名单里记录「谁声明了自己是本组」：
+
+- 名单里看到它声明 → 记录或刷新；
+- 名单里看到它但它不再声明（或退出登记）→ 立即删除；
+- 它暂时掉出名单 → 记录保留；超过粘性 TTL（1 小时）没见到 → 删除；
+- 恰好一个声明者时它就是本组；两个及以上视为冲突，不做回家；表里没有该组（例如刚重启还没有新会话）也不做。
+
+**计时表**：`(分组, 会话)` → 首次发现它绑在非本组账号的时间，在回家检查时才记录。会话绑回本组时删除；只在备用之间换号不重置；超过粘性 TTL 没再见到的条目清掉；硬上限 20000 条；重启后重新计时。
+
+**回家条件（全部满足）**：
+
+1. 会话非空；当前绑定是非本组账号；不是 guardian 父子会话；不是「保留绑定」请求。
+2. 离开本组的时长 ≥ `SUB2API_OURS_STICKY_RETURN_AFTER_SECONDS`（默认 600）。
+3. 本组不在本次请求的排除名单里，且 `shouldEscapeStickyAccount(本组)` 为假（错误率和首字都不超阈值）。
+4. 借用粘性层 `selectBySessionHash` 选本组（模型映射、传输、分组、隐私、配额、利润门等兼容性检查全部复用），且**真的拿到并发槽**；需要排队就放弃。
+5. 本组此刻仍登记且仍声明该组（`ours_tiering` 写回 false 时回家立刻停）。
+
+**成功**：把会话绑定直接改成本组（不走 profit gate 的「准入后绑定」，否则有门时会出现「请求落在本组、绑定仍指向备用」），删除计时条目，打 `ours_sticky_returned_home`。
+
+**失败**（本组满、不兼容、不健康）：会话原样留在当前账号，**不许借机换到别的备用**（换号会丢上游缓存），下次请求再试。回家尝试**不会**产生 `sticky_escape_triggered` 日志（运营者靠它统计真实逃逸）。
+
+**有意的取舍：不动 `previous_response_id` 链。** 这条链的上游状态在产生它的账号上，强行换号有接续失败的风险，链会随对话结束自然过期。这点与旧定时器不同（旧定时器也会删 10 分钟没动的 response 键）。上线前核实过：HTTP 路径上几乎没有请求带 `previous_response_id`，回家机制不受影响。
+
+---
+
+## 五、挂钩点清单
+
+新增文件（全部新增逻辑都在这里）：
+
+- `backend/internal/service/openai_group_tiering.go` —— 档位规则、本组标记解析、tie-break 取值
+- `backend/internal/service/ours_health_home.go` —— 健康降级、探测、本组表、计时表、会话回家、快照按组
+- 对应测试：`openai_group_tiering_test.go`、`ours_health_home_test.go`
+- 前端：`frontend/src/components/account/__tests__/EditAccountModal.oursTiering.spec.ts`
+
+改动的上游代码（行号为当前值，rebase 后以函数名为准）：
 
 | 挂钩 | 位置 | 改动 |
 |---|---|---|
-| **A（算档位表）** | `OpenAIAccountScheduleRequest` 加不导出字段 `oursTiers map[int64]int`（`:93`）；`selectByLoadBalance()`（`:1393`）在过滤循环之前 `:1434` 加一行 `req.oursTiers = openAIAccountRosterTiers(accounts)` | 让档位表建在**分组完整名单**上 |
-| **B（真实路由）** | `buildOpenAIAccountLoadPlan()`（`:851`），改动在 `:902`、`:903`、`:911` | 新增 `tiers := openAIPlanTiers(req, candidates)`；两处 `openAIAccountSchedulingPriority(x)` → `openAISchedulingPriorityFor(x, tiers)` |
-| **C（诊断快照）** | `buildOpenAIAccountSchedulerScoreSnapshot()`（`:2669`），改动在 `:2700`、`:2701`、`:2705` | 新增 `tiers := openAITieredPriorities(accounts)`；同样两处替换 |
-| **D（tie-break）** | `isOpenAIAccountCandidateBetter()`（`:690`），改动在 `:694-695` | `left.account.Priority` → `openAICandidateOrderingPriority(left)`（右侧同理） |
+| 请求结构体 | `openai_account_scheduler.go:93-94` `OpenAIAccountScheduleRequest` | 不导出字段 `oursTiers`、`oursQuietEscape` |
+| **A 算档位** | `selectByLoadBalance()` `:1438` | `req.oursTiers = s.oursRosterTiers(req, accounts)`（在分组完整名单上、failover 排除之前） |
+| **B 真实路由** | `buildOpenAIAccountLoadPlan()` `:906`，及其后两处 | `tiers := openAIPlanTiers(req, candidates)`；两处 `openAISchedulingPriorityFor(x, tiers)` |
+| **C 诊断快照** | 权重视图结构体 `:2623` 字段 `oursGroupID`；`RateLimitService.BuildOpenAIAccountSchedulerScoreSnapshot` `:2660`；`buildOpenAIAccountSchedulerScoreSnapshot()` `:2705` | 管理端按组打分时把分组经 ctx → 权重视图带进快照；`tiers := oursSnapshotTiers(accounts, weights)` |
+| **C′ 管理端** | `handler/admin/account_handler.go:563` `scoreGroupPool` | `service.OursWithSchedulerScoreGroup(ctx, groupID)` |
+| **D tie-break** | `isOpenAIAccountCandidateBetter()` `:698` | `openAICandidateOrderingPriority(left/right)` |
+| **E 会话回家** | `Select()` `:452-454` | `if selection, ok := s.oursTryReturnHome(ctx, req, &decision); ok { return ... }` |
+| **F 静默逃逸日志** | `selectBySessionHash()` `:565`、`:590` | `slog.Info("sticky_escape_triggered", …)` → `oursStickyEscapeInfo(req)("sticky_escape_triggered", …)` |
+| 前端开关 | `EditAccountModal.vue` | 「加入号池动态调度」开关读写 `credentials.ours_tiering`；中英文案在 `i18n/locales/*/admin/accounts.ts` |
 
-**挂钩点 D 是最容易被忽略的一处**：不改它，同档备用会按全局 `priority` 打破平手、退回固定瀑布，整个补丁**静默失效且不报错**。
+上游 Go 文件相对 v0.2.4-ours 净新增 5 行（`oursQuietEscape`、回家挂钩 3 行、`oursGroupID`），其余是单行替换。
 
-### 挂钩点 A 为什么必须存在（设计稿漏了这一条）
+**没有碰的东西**：打分公式段、旧调度路径、`gateway_scheduling.go`、`openAIAccountRuntimeStat`、`account_groups.priority`、任何 settings 键、数据库迁移。
 
-设计稿只说在 `buildOpenAIAccountLoadPlan` 里从候选池算档位。**照那样做，需求 2 不成立**，实测（9 账号、`lb_top_k=2`、20000 次抽样）：
+### 挂钩点 D 的历史说明
 
-| 场景 | 只按候选池算档位 | 按完整名单算档位（当前实现） |
-|---|---|---|
-| 正常 | 本组 99.97% ✅ | 本组 99.97% ✅ |
-| 本组被 failover 排除 | **acct2 独吞 99.97%** ❌ | 负载最低的两个备用各 ~50% ✅ |
-
-原因：`buildOpenAIAccountLoadPlan` 拿到的候选池**已经过滤过** —— `selectByLoadBalance()` 的过滤循环
-（`openai_account_scheduler.go:1436` 起）先剔掉 `req.ExcludedIDs`、不可调度、运行时封禁（429 冷却、
-临时不可调度）的账号。本组账号一出池，剩下备用里 `priority` 最小的那个立刻变成新的「池内最小值」＝档 1，
-溢出又全压在它一个身上，正是这个补丁要消灭的固定瀑布。
-
-所以档位表必须在过滤**之前**算好，并随 `req` 带下去。`listSchedulableAccounts()` 返回的名单不随单次
-请求的失败重试变化，是正确的锚点。`openAIPlanTiers()` 在 `req.oursTiers` 为空时回落候选池自算，
-所以其它调用路径和直接构造 plan 的单测都不受影响。
-
-护栏：`TestBuildOpenAIAccountLoadPlan_RosterTiersSurviveExclusion`（本组出池后备用必须同档同分）
-与 `TestBuildOpenAIAccountLoadPlan_CandidatePoolTiersWouldPromoteBackup`（记录被避免掉的那个行为）。
-rebase 时如果 `req.oursTiers` 的传递链断了，前者会红。
-
-**没有碰的东西**：打分公式段（`openai_account_scheduler.go:980-1060` 附近，7 个月被独立改过 7 次）、`openai_gateway_scheduling.go` 旧路径、`gateway_scheduling.go`、`account_groups.priority` 列、`BindGroups`、任何 DTO/handler/前端、任何 settings 键、数据库迁移。
-
-### 挂钩点 D 的实现与原始设计稿的一处偏差（重要）
-
-设计稿写的是直接改成 `left.priority < right.priority`。**照字面写会打挂上游自带的测试**
-`backend/internal/service/openai_account_scheduler_test.go:3337 TestSelectTopKOpenAICandidates`
-（该测试构造候选时只填了 `account.Priority`，没填候选结构体的 `priority` 字段；全为零值后 tie-break 会掉到 LoadRate，断言 `expected 13, actual 11` 失败）。
-
-因此实际实现改为经 `openAICandidateOrderingPriority()` 取值：
-
-```go
-func openAICandidateOrderingPriority(candidate openAIAccountCandidateScore) int {
-    if candidate.priority != 0 {
-        return candidate.priority
-    }
-    return openAIAccountSchedulingPriority(candidate.account)
-}
-```
-
-- 档位常量全部 > 0，所以**分档路径永远走不到回落分支**，需求 1/2/3 的行为与设计稿完全一致。
-- 未分档时 `candidate.priority == account.Priority`，回落值与原值相同，对上游行为零影响。
-- 好处：**不需要修改任何上游测试文件**，rebase 时冲突面更小。
-
-已核对全部 `isOpenAIAccountCandidateBetter` 调用点（`openai_account_scheduler.go:665`、`:714`、`:725`、`:734`、`:1094`），候选都来自 `plan.candidates`，`priority` 均已在打分循环里赋值。
-`staleSnapshotCompactRetry` 那批候选的 `priority` 确实是零值，但它们走的是自己的比较器
-`sortOpenAICompactRetryCandidates()`（`:1122`），不经过本挂钩点。
+直接写 `left.priority < right.priority` 会打挂上游自带的 `TestSelectTopKOpenAICandidates`（它构造候选时只填 `account.Priority`）。所以经 `openAICandidateOrderingPriority()` 取值：候选 priority 为零值（未经打分循环）时回落 `account.Priority`。档位常量全部 > 0，分档路径永远走不到回落分支。
 
 ---
 
-## 三、怎么配置
+## 六、环境变量（进程启动时读一次）
 
-上游后台**没有** `ours_tiering` 的点选界面；登记/退出走下面那条 API（一行命令）。要能点是另一个独立的小前端补丁，本次不做。
+| 变量 | 默认 | 含义 |
+|---|---|---|
+| `SUB2API_OURS_GROUP_TIERING` | 开 | `0`/`false`/`off` 时分档、降级、探测、回家**全部关闭**，行为回到上游原样 |
+| `SUB2API_OURS_PRIMARY_PROBE_EVERY` | `20` | 被降级的本组每第 N 次选号保持档 1；`0` 关闭探测 |
+| `SUB2API_OURS_STICKY_RETURN_AFTER_SECONDS` | `600` | 会话离开本组多久后尝试回家；`0` 关闭回家 |
+
+非法值（非整数、负数）回落默认值。
+
+## 七、日志事件（事件名固定，不要改）
+
+| 事件 | 何时打 | 字段 |
+|---|---|---|
+| `ours_primary_demoted` | 本组进入降级（只在状态切换时打） | `account_id` `error_rate` `threshold` |
+| `ours_primary_restored` | 本组退出降级（只在状态切换时打） | 同上 |
+| `ours_sticky_returned_home` | 每次成功回家 | `group_id` `from_account_id` `to_account_id` `off_own_seconds` |
+
+降级在管理端 `scheduler_scores` 里看不到（快照路径把错误率固定为 0），只能看日志。
+
+---
+
+## 八、怎么配置
 
 | 我想做的事 | 用什么 |
 |---|---|
-| 让某账号参与分档 | `bulk-update` 写 `credentials.ours_tiering: true` |
-| 让某账号退出分档（回到上游排法） | 写 `credentials.ours_tiering: false` |
-| 新加一个账号进某组、先观察不参与 | 什么都不做——不登记就不参与，它在该池里排第 4 档（最后），`base_score` 会落到该组最低（见第五节的验证方法） |
-| 让某账号给某组当备用 / 不再当备用 | 上游后台把它勾进 / 勾出该分组（`group_ids`，本来就有） |
-| 指定谁是某组的「本组账号」 | 让它是该组**登记账号**中全局 `priority` 最小的（现状即如此） |
-| 指定谁是「兜底」 | 让它是该组登记账号中 `priority` 最大的（monocle 998） |
-| 让两个账号并列做某组的本组账号 | 给它们相同且最小的 `priority`（都成档 1，均分） |
+| 让某账号参与动态调度 | 后台编辑账号，打开「加入号池动态调度」；或 `bulk-update` 写 `credentials.ours_tiering: true` |
+| 让某账号退出 | 关掉开关；或写 `credentials.ours_tiering: false` |
+| 指定某账号是哪些组的本组 | `bulk-update` 写 `credentials.ours_home_groups: "11,12,13"`（后台没有这个输入框） |
+| 指定兜底 | 让它是登记账号里 priority 严格最大且唯一的 |
+| 让某账号给某组当备用 / 不再当备用 | 把它绑进 / 移出该分组（`group_ids`） |
+| 新加一个账号进某组、先观察不参与 | 什么都不做——不登记就排在最后 |
 | 一键整体关回上游行为 | 环境变量 `SUB2API_OURS_GROUP_TIERING=0` 重启 |
 
-### 登记命令（上线唯一要做的配置）
+「加入号池动态调度」和上游的「号池模式」（`pool_mode`）是两个独立的设置，互不影响。
 
-`POST /api/v1/admin/accounts/bulk-update` 对 `credentials` 做 **JSONB key 级合并**，不会清掉 `model_mapping` 等其它键：
-
-```json
-{"account_ids":[1860,1863,1864,1865,1866,1867,1868,1869,1872],"credentials":{"ours_tiering":true}}
-```
-
-写后**逐账号 GET 回读**，确认两件事：
-1. `credentials.ours_tiering == true`
-2. `credentials.model_mapping` 的键数没变
-
-### 已知坑（每次动过账号都要复查）
-
-- 后台对账号做**「重新授权」会整体替换 `credentials`** —— `ours_tiering` 会和 `model_mapping` 一起丢。
-- `PUT /api/v1/admin/accounts/{id}` 带 `credentials` 时，**未提交的非敏感键会被清空**（`model_mapping` 就因此丢过）。
-
-→ **在后台改过任何账号之后，复查该账号的 `ours_tiering` 与 `model_mapping`。**
-
----
-
-## 四、运行约束
-
-- **`lb_top_k` 必须保持 2。** K 放大到池大小时，monocle 的 pf=0 会把归一化下限拉到 0，加权随机权重变成 `10001` vs `5001×N`，本组账号的第一顺位概率会从 ~99.98% 掉到约 22%。
-- 其余 settings 保持现状，补丁不需要改任何一项：
-  `openai_advanced_scheduler_enabled=true`、`weight_priority=10000`、`weight_error_rate=500`、`weight_load=0`、`weight_ttft=0`。
-- 8 个专属账号的全局 priority 梯子（10/20/30/40/50/60/70/80）保持不变——它仍然定义「谁是本组」。monocle 保持 998。
-- 24 个分组的 `group_ids` 保持不变。
-
-### 现有配置下的推演
-
-- **有多个备用的组**：本组 pf=1.0 → 10000；备用 pf=0.5 → 5000；monocle pf=0 → 0。TopK=2 = {本组, 当前最空的那个备用}，加权随机权重 5001 : 1 → 本组第一顺位 ≈99.98%。
-- **本组失败被 failover 排除后**：档位表来自完整名单，备用仍然全是档 2 → 重新归一化后 pf 相等 → TopK = 在飞最少的两个备用，50/50；有错误的备用 `errorFactor` 低 → 分数低 → 不进 TopK。负载与健康两个维度都起作用。（实测 20000 次抽样：负载 5% 与 80% 的两个备用各占 ~50%，负载 90% 的那个 0%。）
-- **只有 {本组, monocle} 的组**：档 1/3 → pf 1.0/0 → 与现状完全一致。
-- **池内无登记账号的组**：`tiers == nil` → 全部走原 priority → 与上游逐字节一致。
-
----
-
-## 五、部署与回滚
-
-部署流程：跑 origin guard → 上传到临时名并核 sha256 → 备份旧二进制 → 换二进制（`chown sub2api:sub2api`）→ 重启 → 回读版本 → 跑验收脚本。
-
-几个实测过的坑：
-
-- **不要跑 `/opt/sub2api/sub2api --version`**：它不是标准 flag，会真的启动进程、抢 8080 端口和数据库连接。
-  回读版本用管理 API：`GET /api/v1/admin/system/version`（带 `x-api-key`）→ `{"version":"0.2.4-ours"}`。
-  `GET /version` 会被前端 SPA 接管，拿不到后端版本；启动日志里也没有版本横幅。
-- **unit 里有 `ExecStartPre=+/usr/local/sbin/sub2api-origin-guard --prestart`**：它查 Cloudflare，确认三个域名 A 记录都指向本机，
-  任一对不上就 exit 1、服务起不来。换二进制前先单独跑一次确认放行，否则会误判成补丁的问题。
-- **unit 是 `User=sub2api`**：`sshctl put` 上传的文件属主是 root，换完要 `chown sub2api:sub2api` 恢复原状。
-- 管理 API 认证头是 `x-api-key`（`Authorization: Bearer` 会 401）；密钥文件在 `/etc/sub2api-tg-bot/sub2api-admin-key`，
-  只在服务器上用 `$(tr -d "\n" < 文件)` 引用，不要打印。
-- 数据库是容器里的 Postgres（`sub2api-containers.service` 只是 `podman start sub2api-postgres sub2api-redis`），
-  本补丁零迁移，不需要备份数据库。
-
-回滚（任选其一，**数据都不需要改**）：
-
-1. 换回上游二进制；
-2. systemd unit 加 `Environment=SUB2API_OURS_GROUP_TIERING=0` 后重启（进程启动时读一次）；
-3. 把 9 个账号的 `credentials.ours_tiering` 改为 `false`。
-
-### 验证补丁是否生效
-
-管理端账号列表**默认不返回**调度打分，必须带 `include_scheduler_score=true`：
+写入命令模板（管理 API 认证头是 `x-api-key`，不是 Bearer；密钥只在服务器上从受限文件读取，不要打印）：
 
 ```bash
-K=$(tr -d "\n" < /etc/sub2api-tg-bot/sub2api-admin-key)
-curl -sS -H "x-api-key: $K" \
-  "http://127.0.0.1:8080/api/v1/admin/accounts?include_scheduler_score=true&platform=openai&page=1&page_size=100"
+curl -sS -X POST -H "x-api-key: $KEY" -H "Content-Type: application/json" \
+  -d '{"account_ids":[<ID>],"credentials":{"ours_home_groups":"11,12,13"}}' \
+  "$BASE/api/v1/admin/accounts/bulk-update"
 ```
 
-每个账号的 `scheduler_scores[]` 按分组给出 `{group_id, base_score, sticky_score}`。
-**注意：这里没有 priority 字段，档位不会以 1/2/3/4 的数字形式出现**，只体现在 `base_score` 上。
+`bulk-update` 对 `credentials` 做 **JSONB 按键合并**，不会清掉其它键；对 `group_ids` 是**全量替换**（先 GET 现值再合并）。每次写完逐个 GET 回读。
 
-判读方法：取同一个 `group_id` 下所有账号的 `base_score` 排序看**形态**。
-线上权重（`weight_priority=10000`、`weight_error_rate=500`、其余 0）下，快照里 `errorFactor` 固定为 1，
-所以 `base_score = 10000 × pf + 500`：
+### 验证分档是否生效
 
-| 状态 | 同组 base_score 形态 |
+管理端账号列表默认**不返回**调度打分，需要带 `include_scheduler_score=true`。`scheduler_scores[]` 按分组给出 `base_score`，**没有 priority 字段**，档位只体现在分数上。线上权重（`W_priority=10000`、`W_error_rate=500`）下，一个分组内：
+
+| 状态 | base_score 形态 |
 |---|---|
-| **未分档**（无登记账号 / 开关关闭） | 连续梯子，备用们分数**各不相同**（等差递减） |
-| **已分档**，组内有 1/2/3 档 | 本组 `10500`，备用们**全部同一个值** `5500`，兜底 `500` |
-| **已分档**，组内有 1/2/3/4 档 | 本组 `10500`，备用 `7166.67`，兜底 `3833.33`，未登记 `500` |
+| 未分档 | 连续梯子，备用们分数各不相同 |
+| 已分档（1/2/3 档） | 本组 `10500`，其它登记账号**全部同一个值** `5500`，兜底 `500` |
+| 已分档，另有未登记账号 | 本组 `10500`，备用 `7166.67`，兜底 `3833.33`，未登记 `500` |
 
-备用们的分数从各不相同**塌缩成同一个值**，就是补丁生效的铁证；某个账号落在该组最低，
-且它不是兜底，就是漏登记了。这比看命中率快得多，不受上游风暴影响，不用等流量。
+### credentials 写回路径（核实过，都保留 `ours_*` 键）
 
-#### 生产实测（2026-09-10，Oracle-SGwest-arm）
+| 路径 | 结论 |
+|---|---|
+| OAuth token 刷新 | 新 token 与旧 credentials 合并，未涉及的键原样保留（`token_refresher.go` → `MergeCredentials`） |
+| 后台编辑 | 前端整份展开回传（任何键、任何类型），后端只补回 token 类敏感键 |
+| 账号测试 | 只读 token，写库只写 `extra` 列和状态列 |
 
-组 12（本组 1868），登记前后：
-
-| 账号 | priority | 登记前 | 登记后 |
-|---|---|---|---|
-| 1868 | 30 | 10500.00 | 10500 |
-| 1860 | 40 | 10396.69 | **5500** |
-| 1866 | 50 | 10293.39 | **5500** |
-| 1865 | 60 | 10190.08 | **5500** |
-| 1864 | 70 | 10086.78 | **5500** |
-| 1863 | 80 | 9983.47 | **5500** |
-| 1872 | 998 | 500.00 | 500 |
-
-登记前那列可以手算核对：`pf(40) = 1 − (40−30)/968 = 0.98967` → `10000 × 0.98967 + 500 = 10396.7`，
-证明**未登记时新二进制的打分与上游逐字节一致**。
-
-组 2 验证了第 4 档：未登记的 1752 (Nube) 全局 priority=10，与本组 1869 相同，
-登记后仍落到 `500`（最后），而 1869 为 `10500`、两个备用同为 `7166.67`、兜底 `3833.33`。
-
-#### 验收脚本的窗口陷阱
-
-`/usr/local/sbin/sub2api-cascade-verify-daily` 的 current 窗口是「此刻往前 3 小时」。
-**刚部署或刚登记完就跑，报告里几乎全是旧行为的数据**，测不到补丁。
-要等补丁跑满一个窗口（3 小时）再看 `own_hit_pct` 与 `distinct_backup_accounts`。
-上线当天就用上面的 `base_score` 形态做即时验证。
+**仍然要注意**：后台「重新授权」会整体替换 `credentials`；直接调 `PUT /accounts/{id}` 且带 `credentials` 时，未提交的非敏感键会被清空。动过账号后复查 `ours_tiering`、`ours_home_groups`、`model_mapping`。
 
 ---
 
-## 六、跟随上游的 SOP
+## 九、运行约束
 
-分支约定：
+- **`lb_top_k` 保持 2。** K 放大到池大小时兜底的 pf=0 会把归一化下限拉到 0，本组第一顺位概率会从约 99.98% 大幅下降。
+- `weight_error_rate` 保持现值，降级靠它在同档之间挑健康的；**不要靠调大它来补救**，行为已经写在源码里。
+- `sticky_weighted` 模式下（线上关闭）不做会话回家。
+- WebSocket 只在建立连接走 `Select()` 时可能回家，连接内的轮次不重新选号。
 
-- `main` —— 只镜像上游，**永远不放补丁**；
-- `ours/scheduler-patch` —— 放补丁（1–2 个 commit）；
-- 每次发版打 `vX.Y.Z-ours` tag 推到 fork。
+---
 
-每次上游发新 tag，跑 `ours/rebase.sh vX.Y.Z`，它会按顺序做：
+## 十、部署与回滚
 
-1. `git fetch upstream --tags`，把 `main` 硬同步到 `upstream/main` 并 `push -f origin main`；
-2. **先看 `backend/migrations/` 的 diff**（`git diff v<旧>..v<新> -- backend/migrations/`）。上游用内嵌迁移、二进制启动时自动执行、**没有 down 迁移**。**迁移 diff 非空 → 脚本停下来把 diff 打出来，必须人工拍板后才继续。这是唯一不能自动化的门。**
-3. `git checkout ours/scheduler-patch && git rebase vX.Y.Z`；
-4. `make test-backend` + 本补丁的单测全绿，`go build ./...` 通过；
-5. 构建 linux/arm64 二进制并输出 sha256；
-6. `git push -f origin ours/scheduler-patch`；`git tag vX.Y.Z-ours && git push origin vX.Y.Z-ours`。
+部署：跑前置守卫 → 上传二进制到临时名并核对 sha256 → 备份旧二进制 → 替换并恢复属主 → 重启 → 用管理 API `GET /api/v1/admin/system/version` 回读版本。
+
+- 不要直接执行二进制加 `--version`：它不是标准 flag，会真的启动进程、抢端口和数据库连接。
+- `GET /version` 会被前端 SPA 接管，拿不到后端版本。
+- 本补丁零迁移，不需要备份数据库。
+
+**外部粘性过期定时器已退役**：它的功能由本版源码接管，部署后必须 disable，否则两套机制同时挪会话、也分不清效果是谁的。只 disable，不删除脚本和状态目录，回滚要用。
+
+### 回滚（顺序不能颠倒）
+
+- **快速止血**：把登记账号写回 `ours_tiering=false`，秒级生效，不重启。若 priority 已统一，整组退化为「专属账号平摊、兜底最后」，不会压到单个账号。
+- **完整回滚到旧梯子**：按快照逐个恢复每个账号的 `group_ids` 和 `priority` → 写 `ours_tiering=false` → 需要的话回滚二进制 → **最后**才能重开外部粘性过期定时器。
+- 回滚到 `v0.2.4-ours` 或上游二进制、或设置了 `SUB2API_OURS_GROUP_TIERING=0` / `SUB2API_OURS_STICKY_RETURN_AFTER_SECONDS=0` 时，**必须同时恢复外部粘性过期定时器**，否则会话又会钉在备用上。
+- **在「全量绑定 + priority 统一」状态下绝对不能重开旧定时器**：它按「组内 priority 最小、再取 id 最小」认本组，会把所有组的本组都认成同一个账号。
+
+---
+
+## 十一、跟随上游的 SOP
+
+每次上游发新 tag，跑 `ours/rebase.sh vX.Y.Z`：
+
+1. 同步 upstream、把 `main` 硬同步到 `upstream/main`；
+2. **先看 `backend/migrations/` 的 diff**：上游迁移内嵌、启动时自动执行、没有 down 迁移。非空就停，人工拍板后加 `--migrations-reviewed` 重跑。这是唯一不能自动化的门；
+3. `git rebase vX.Y.Z`；
+4. **挂钩锚点检查**：逐个 grep 第五节的挂钩行（含次数），缺失或重复就停；
+5. `go build` + `go test ./...` + 补丁单测 + 前端开关单测 + `golangci-lint`；
+6. `ours/build-release.sh` 出 `sub2api_<版本>_linux_{arm64,amd64}.tar.gz` + `checksums.txt`（与上游同形态；二进制本体约 107MB，和上游一样，GitHub 上看到的 30 多 MB 是压缩后大小）；
+7. 加 `--push` 才会推 fork 并打 tag。
 
 ### 冲突处理原则
 
-**可以自行解决**（不用问）：
-
-- 纯位置漂移、空白差异、import 顺序、上下文行变化；
-- 挂钩函数体内其它行被改动，但那两处 `openAISchedulingPriorityFor(...)` 调用形状不变。
+**可以自行解决**：纯位置漂移、空白、import 顺序、上下文行变化；挂钩函数体内其它行被改但挂钩行形状不变。
 
 **必须停下来人工确认**：
 
-- 挂钩函数被删除、改签名或改语义（`selectByLoadBalance` / `buildOpenAIAccountLoadPlan` / `buildOpenAIAccountSchedulerScoreSnapshot` / `isOpenAIAccountCandidateBetter`）；
-- `selectByLoadBalance` 里那段过滤循环被挪走、或 `listSchedulableAccounts` 的返回语义变化（挂钩点 A 的锚点）；
-- `OpenAIAccountScheduleRequest` 不再按值传递、或字段被重排/重写（`oursTiers` 靠它带下去）；
-- `openAIAccountCandidateScore` 的字段改名（尤其 `priority`）或候选池构造方式变化；
-- `Account.Credentials` 的类型或访问方式变化；
-- 打分公式段或 TopK / 加权随机逻辑变化；
-- settings 键改名；
+- 挂钩函数被删除、改签名或改语义（`Select` / `selectBySessionHash` / `selectByLoadBalance` / `buildOpenAIAccountLoadPlan` / `buildOpenAIAccountSchedulerScoreSnapshot` / `isOpenAIAccountCandidateBetter`）；
+- `selectByLoadBalance` 的过滤循环被挪走，或 `listSchedulableAccounts` 返回语义变化；
+- `OpenAIAccountScheduleRequest` 不再按值传递，或权重视图结构体被重写；
+- `sticky_escape_triggered` 日志被改名或挪位（静默标志依赖它）；
+- 管理端 `scoreGroupPool` 的打分调用方式变化；
+- `openAIAccountCandidateScore` 字段改名（尤其 `priority`）；`Account.Credentials` 类型或访问方式变化；
+- 打分公式段或 TopK / 加权随机逻辑变化；settings 键改名；
 - `backend/migrations/` diff 非空。
 
-**如果上游自己实现了同类功能**（读了 `account_groups.priority`、把 `model_routing` 接进 OpenAI、或加了分组内优先级）→ **放弃本补丁，改用上游实现**，并在本文件里记录这个决定。
+**如果上游自己实现了同类功能**（读了 `account_groups.priority`、加了分组内优先级或本组概念）→ 放弃本补丁、采用上游实现，并在本文件记录。
 
-### fork 上的 GitHub Actions（**默认已整体关闭，见下**）
+---
 
-`.github/workflows/ours-release.yml` 是本 fork 私有的最小工作流：在 `v*-ours` tag 上跑后端测试 +
-补丁单测，产出 `sub2api_linux_arm64` 附件（含 sha256）。它不建 Release、不推任何镜像，
-并且带 `if: github.repository == 'Cd1s/sub2api'` 双保险。
+## 十二、fork 上的 GitHub Actions（默认整体关闭）
 
-**但是**：上游 `.github/workflows/release.yml` 的触发条件是 `push: tags: 'v*'`，
-**`v0.2.4-ours` 会被它匹配到**。fork 上如果开着 Actions，推我们的 tag 会顺带触发上游那套完整发布流程
-（建 GitHub Release、推 GHCR/DockerHub 镜像到你的账号名下）。上游 `backend-ci.yml` 更是 `on: push`，
-每次推分支都会跑。
+上游 `.github/workflows/release.yml` 的触发条件是 `push: tags: 'v*'`，会匹配 `-ours` tag，在 fork 上跑完整发布（建 Release、推镜像到 fork 所有者名下）；上游 `backend-ci.yml` 是 `on: push`。因此 fork 的 Actions **整体关闭**，所有构建在本机做。
 
-因此 **fork 的 Actions 已经整体关闭**（`repos/Cd1s/sub2api` → Settings → Actions → Disable）。
-当前所有构建都在本机做，不依赖 CI。
-
-要启用 CI，顺序**不能反**（先关掉上游工作流，再开 Actions）：
+`.github/workflows/ours-release.yml` 是 fork 私有的最小工作流（`v*-ours*` tag 上跑测试并出两个架构的 tar.gz），带 `if: github.repository == 'Cd1s/sub2api'` 双保险。要启用，顺序不能反：
 
 ```bash
-# 1) 先开 Actions（这一步之后 GitHub 才会注册工作流，才能逐个禁用）
 gh api -X PUT repos/Cd1s/sub2api/actions/permissions -F enabled=true
-
-# 2) 立刻把上游那几个工作流禁掉——尤其 release.yml
 for w in release.yml backend-ci.yml security-scan.yml cla.yml; do
   gh api -X PUT "repos/Cd1s/sub2api/actions/workflows/$w/disable"
 done
-
-# 3) 确认只剩 ours-release.yml 是 active
 gh api repos/Cd1s/sub2api/actions/workflows --jq '.workflows[] | "\(.path)\t\(.state)"'
 ```
 
-随时可以一键关回去：
+---
 
-```bash
-gh api -X PUT repos/Cd1s/sub2api/actions/permissions -F enabled=false
-```
+## 十三、单测护栏
 
-### 单测就是护栏
-
-`backend/internal/service/openai_group_tiering_test.go` 里的这几个测试分别钉住一个挂钩点，rebase 后如果上游重构了挂钩处，它们会先红：
-
-| 测试 | 保护的挂钩 |
+| 测试 | 保护什么 |
 |---|---|
-| `TestBuildOpenAIAccountLoadPlan_RosterTiersSurviveExclusion` | A（本组出池后备用仍同档同分 —— 需求 2 的命脉） |
-| `TestOpenAIAccountRosterTiers` / `TestOpenAIPlanTiers_PrefersRequestRoster` | A（名单档位表与回落逻辑） |
-| `TestBuildOpenAIAccountLoadPlan_EnrolledAccountsUseTiers` | B（真实路由用档位打分） |
-| `TestBuildOpenAIAccountLoadPlan_UnenrolledPoolMatchesUpstream` | B（无登记账号时与上游一致） |
-| `TestBuildOpenAIAccountSchedulerScoreSnapshot_UsesTiers` | C（诊断快照与真实路由同一套档位） |
-| `TestIsOpenAIAccountCandidateBetter_SameTierBreaksByLoadRate` | D（同档按 LoadRate 分散） |
-| `TestIsOpenAIAccountCandidateBetter_UnscoredCandidateFallsBackToAccountPriority` | D（零值回落，保上游测试） |
-| `TestOpenAITieredPriorities` | 档位表本身（含未登记账号混入的场景） |
+| `TestOursGroupTiers_FullBindingEveryGroupHasOnlyItsHomeAsPrimary` | 全量绑定时 24 个组每组档 1 恰好是本组，其余备用档 2，兜底档 3 |
+| `TestOursGroupTiers_HomeAbsentFromRosterHasNoPrimary` | 本组掉出名单时没有别的号顶替成档 1 |
+| `TestOursGroupTiers_UnmarkedGroupHasNoPrimary` / `NoGroupContextHasNoPrimary` | 没有标记的组、没有分组上下文时不设档 1 |
+| `TestOursGroupTiers_MaxPriorityTieHasNoFallback` / `UnifiedPrioritiesKeepTiers` | priority 并列无档 3；priority 统一后档位不变 |
+| `TestOursParseHomeGroups` | 字符串 / 数组 / 空串 / 非法值解析 |
+| `TestOursSnapshotTiersMatchRoutingTiers` / `TestRateLimitServiceSchedulerScoreSnapshot_UsesGroupFromContext` | 管理端按组的档位与真实路由一致（挂钩 C、C′） |
+| `TestOursPrimaryHealth_*` | 降级阈值（小于 / 大于 / 等于）、只看错误率、探测每 N 次 1 次、恢复、切换日志各一次、排除时不耗探测 |
+| `TestOursReturnHome_*` | 未满 600 秒不回、满足条件回家并改绑定、不健康 / 满 / 不支持模型时留在原备用且无逃逸日志、无唯一本组不做、previous_response 不变、开关关闭、撤销登记立刻停、profit gate 下绑定真的改成本组 |
+| `TestOursOffHomeTable_ExpiryAndCap` / `TestOursGroupHomeTable_*` | 计时表过期与上限、本组表黏住语义 |
+| `TestBuildOpenAIAccountLoadPlan_*` | 挂钩 A、B：真实路由按档打分，本组出池后备用仍同档 |
+| `TestIsOpenAIAccountCandidateBetter_*` | 挂钩 D：同档按 LoadRate、零值回落 |
+| `EditAccountModal.oursTiering.spec.ts` | 前端开关读写 `ours_tiering`，不碰其它 credentials 键 |

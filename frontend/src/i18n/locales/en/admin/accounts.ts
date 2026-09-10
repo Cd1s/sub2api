@@ -979,6 +979,10 @@ export default {
       loadFactorHint: 'Higher load factor increases scheduling frequency',
       priority: 'Priority',
       priorityHint: 'Lower value accounts are used first',
+      oursTiering: {
+        title: 'Join pool dynamic scheduling',
+        desc: 'When enabled, this account joins dynamic scheduling: it goes first in its home groups and serves as an equal-tier backup in every other group, with load spread evenly. Unchecked accounts do not take part and rank after all participating accounts. To make an account the last-resort fallback, give it the highest priority. This is independent of Pool Mode.'
+      },
       billingRateMultiplier: 'Billing Rate Multiplier',
       billingRateMultiplierHint: '0 = free, affects account billing only',
       expiresAt: 'Expires At',
