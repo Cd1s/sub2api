@@ -36,9 +36,12 @@ rm -f "$OUT_DIR"/sub2api_*_linux_*.tar.gz "$OUT_DIR/checksums.txt"
 
 # macOS 的 bsdtar 默认会把扩展属性打进包里，Linux 解包会出现 ._ 文件，关掉。
 TAR_EXTRA=()
-if tar --help 2>&1 | grep -q -- '--no-mac-metadata'; then
+probe_dir="$(mktemp -d)"
+touch "$probe_dir/probe"
+if tar --no-mac-metadata -czf "$probe_dir/probe.tgz" -C "$probe_dir" probe >/dev/null 2>&1; then
   TAR_EXTRA+=(--no-mac-metadata)
 fi
+rm -rf "$probe_dir"
 export COPYFILE_DISABLE=1
 
 for arch in "${ARCHES[@]}"; do
@@ -57,7 +60,8 @@ for arch in "${ARCHES[@]}"; do
   cp LICENSE* README* PATCH-NOTES.md "$stage/" 2>/dev/null || true
   cp -R deploy "$stage/deploy"
   tarball="$OUT_DIR/sub2api_${VERSION}_linux_${arch}.tar.gz"
-  tar "${TAR_EXTRA[@]}" -czf "$tarball" -C "$stage" .
+  # ${arr[@]+...} 写法兼容 macOS 自带的 bash 3.2（set -u 下空数组会被当成未定义）。
+  tar ${TAR_EXTRA[@]+"${TAR_EXTRA[@]}"} -czf "$tarball" -C "$stage" .
   rm -rf "$stage"
 done
 
